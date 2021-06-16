@@ -1,4 +1,4 @@
-botocor
+botocore
 boto3
 deepspeed
 filelock

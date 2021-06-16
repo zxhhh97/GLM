@@ -186,7 +186,7 @@ def add_training_args(parser):
     group.add_argument('--distributed-backend', default='nccl',
                        help='which backend to use for distributed training. One of [gloo, nccl]',
                        choices=['nccl', 'gloo'])
-    group.add_argument('--DDP-impl', default='torch', choices=['local', 'torch'],
+    group.add_argument('--DDP-impl', default='torch', choices=['local', 'torch', 'none'],
                        help='which DistributedDataParallel implementation to use.')
 
     group.add_argument('--local_rank', type=int, default=None,
@@ -368,6 +368,17 @@ def add_finetune_config_args(parser):
     group.add_argument('--start-validation', action='store_true')
     return parser
 
+def add_api_args(parser):
+    """api arguments"""
+    group = parser.add_argument_group('api', 'api configurations')
+    group.add_argument('--time_interval', default=10)
+    group.add_argument('--DBname', default='Reddit')
+    group.add_argument('--num_gen_at_once', default=20)
+    group.add_argument('--generate', action='store_true')
+    group.add_argument('--no_print', action='store_true')
+    #group.add_argument('--device', default=0)
+
+    return parser
 
 def get_args():
     """Parse all the args."""
@@ -380,6 +391,7 @@ def get_args():
     parser = add_text_generate_args(parser)
     parser = add_data_args(parser)
     parser = add_finetune_config_args(parser)
+    parser = add_api_args(parser)
 
     # Include DeepSpeed configuration arguments
     parser = deepspeed.add_config_arguments(parser)

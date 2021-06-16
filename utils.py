@@ -386,7 +386,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, args):
                 exit()
 
     # Iterations.
-    if args.finetune or release:
+    if args.finetune or release or args.generate:
         iteration = 0
     else:
         try:
