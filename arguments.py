@@ -372,6 +372,7 @@ def add_api_args(parser):
     """api arguments"""
     group = parser.add_argument_group('api', 'api configurations')
     group.add_argument('--time_interval', default=10)
+    group.add_argument('--saved_path', default="./samples/generated/")
     group.add_argument('--DBname', default='Reddit')
     group.add_argument('--num_gen_at_once', default=20)
     group.add_argument('--generate', action='store_true')

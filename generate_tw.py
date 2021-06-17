@@ -273,6 +273,7 @@ def generate_samples(model, tokenizer, args, device, data=None, outname = None):
     if not outname:
         output_path = os.path.join(output_path, f"sample-{datetime.now().strftime('%m-%d-%H-%M')}.txt")
     else:
+        output_path = args.saved_path
         output_path = os.path.join(output_path, f"sample-{outname}.txt")
     with torch.no_grad(), open(output_path, "a") as output:
         while True:

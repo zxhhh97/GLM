@@ -69,7 +69,7 @@ def replace_regex(x, remove=None):
     x = re.sub(r"\s{1,}"," ", x) # delete redundant space
 
     # delete repeating sentences
-    tmp = re.sub(r'(.+[^\s])(\s+\1){1,}',"\g<1>",x)
+    tmp = re.sub(r'\b(.+[^\s])(\s+\1){1,}',"\g<1>",x)
     while (len(x)>len(tmp)):
         x = tmp
         tmp = re.sub(r'\b(.+[^\s])(\s+\1){1,}',"\g<1>",x)
@@ -101,7 +101,7 @@ class InteractDB():
         self.guide_prompt = self.DBinfo['guide_prompt']
 
     def query_docs(self, num = 100):
-        query = {self.update_key:{"$exists":False}}
+        query = {self.update_key:{"$exists":False}, "generate_updated_t":{"$exists":False}}
         cursor = self.indata.find(query).sort([("crawled_time_t",-1)]).limit(num)
         return cursor
 
@@ -139,6 +139,7 @@ class InteractDB():
 
 
 if __name__ =="__main__":
-    st1 = timeswitch(1622981802,sourcetz="utc",targettz="cn",totype='str')
+    t1 = datetime.datetime.now().timestamp()
+    st1 = timeswitch(t1,sourcetz="utc",targettz="cn",totype='str')
     st2 = timeswitch("2021-06-06 20:16:42",sourcetz="cn",targettz="cn",totype='timestamp')
-    print(st1,st2)
+    st3 = timeswitch("2021-06-16 18:58:42",sourcetz="cn",targettz="utc",totype='str')
