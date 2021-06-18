@@ -75,11 +75,16 @@ def replace_regex(x, remove=None):
         tmp = re.sub(r'\b(.+[^\s])(\s+\1){1,}',"\g<1>",x)
     # delete too long words
     x = re.sub(r"(\w){20,}","",x)
+
     x = x.replace('_',"")
     x = re.sub(r"\$\s(?=[0-9])",'\$',x)  # $ 999 -> $999
     x = re.sub(r"(?<=[a-zA-Z])\s(\'|’)\s(?=[a-zA-Z])", "'", x) # I'm ,he's 
     x = re.sub(r"(?<=[0-9])\s\.\s(?=[0-9])",".", x)        # 9 . 1-> 9.1
     x = re.sub(r"(?<=\w)\s([\.\?\!，,\:\：])\s", "\g<1> ", x) #  end . new -> end. new
+    
+    # the start of sentence
+    x = re.sub(r"^\"\s", "\"",x)  # " a -> "a
+    x = re.sub(r"^[\w\"]+", "", x) # remove *?# 
     
     # upper case at the start of sentence
     x = re.sub(r"(?:^|[\.\!\?]\s?\"?\s?)([a-z])",lambda m:m.group(0).upper(),x)
@@ -101,7 +106,10 @@ class InteractDB():
         self.guide_prompt = self.DBinfo['guide_prompt']
 
     def query_docs(self, num = 100):
-        query = {self.update_key:{"$exists":False}, "generate_updated_t":{"$exists":False}}
+        query = {"$or":[
+            {self.update_key:{"$or":[{"$exists":False} , {"$regex":r"(^[^\w\"])|(^\"[^\w])"} ]}},
+            {"generate_updated_t":{"$exists":False}}]
+                 }
         cursor = self.indata.find(query).sort([("crawled_time_t",-1)]).limit(num)
         return cursor
 
@@ -120,8 +128,9 @@ class InteractDB():
 
     def postprocess_generated_content(self, content, max_length=140):
         content = cutoff_generated(content)
+        if "[UNK]" in content:
+            return None
         content = replace_regex(content, self.guide_prompt)
-        
         content = cut_max_length(content, max_length)
         if content and len(content) < 20:
             return None

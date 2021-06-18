@@ -32,7 +32,7 @@ MASTER_PORT=${MASTER_PORT} python generate_samples.py \
        $MODEL_ARGS \
        --tokenizer-type BertWordPieceTokenizer \
        --tokenizer-model-type bert-large-uncased \
-       --fp16 \
+       #--fp16 \
        --cache-dir cache \
        --num-beams 2 \
        --length-penalty 0.2 \
