@@ -9,3 +9,4 @@
 /blocklm-1.5-generation*
 *.pyc
 selftest.py
+transformers/

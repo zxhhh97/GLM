@@ -53,13 +53,12 @@ def cut_max_length(x,length):
         x = x[:m[-1].span()[1]]
         return x
     else:
-        return x
+        return None
     
     
 
 def replace_regex(x, remove=None): 
     x = x.strip()
-    
     x = re.sub(r"\bi\b","I",x) # i -> I 
     # delete repeating single char withspace between
     x = re.sub(r"(\b\w|\W)(\s+\1){1,}", "\g<1>", x)
@@ -67,7 +66,6 @@ def replace_regex(x, remove=None):
     # delete repeating words
     x = re.sub(r'\b(\w+)(\s+\1){1,}',"\g<1>",x) # repeating words
     x = re.sub(r"\s{1,}"," ", x) # delete redundant space
-
     # delete repeating sentences
     tmp = re.sub(r'\b(.+[^\s])(\s+\1){1,}',"\g<1>",x)
     while (len(x)>len(tmp)):
@@ -75,16 +73,14 @@ def replace_regex(x, remove=None):
         tmp = re.sub(r'\b(.+[^\s])(\s+\1){1,}',"\g<1>",x)
     # delete too long words
     x = re.sub(r"(\w){20,}","",x)
-
     x = x.replace('_',"")
     x = re.sub(r"\$\s(?=[0-9])",'\$',x)  # $ 999 -> $999
     x = re.sub(r"(?<=[a-zA-Z])\s(\'|’)\s(?=[a-zA-Z])", "'", x) # I'm ,he's 
     x = re.sub(r"(?<=[0-9])\s\.\s(?=[0-9])",".", x)        # 9 . 1-> 9.1
     x = re.sub(r"(?<=\w)\s([\.\?\!，,\:\：])\s", "\g<1> ", x) #  end . new -> end. new
-    
     # the start of sentence
     x = re.sub(r"^\"\s", "\"",x)  # " a -> "a
-    x = re.sub(r"^[\w\"]+", "", x) # remove *?# 
+    x = re.sub(r"^[^\w\"]+", "", x) # remove *?# 
     
     # upper case at the start of sentence
     x = re.sub(r"(?:^|[\.\!\?]\s?\"?\s?)([a-z])",lambda m:m.group(0).upper(),x)
@@ -106,10 +102,8 @@ class InteractDB():
         self.guide_prompt = self.DBinfo['guide_prompt']
 
     def query_docs(self, num = 100):
-        query = {"$or":[
-            {self.update_key:{"$or":[{"$exists":False} , {"$regex":r"(^[^\w\"])|(^\"[^\w])"} ]}},
-            {"generate_updated_t":{"$exists":False}}]
-                 }
+        query = {self.update_key:{"$exists":False}}
+       
         cursor = self.indata.find(query).sort([("crawled_time_t",-1)]).limit(num)
         return cursor
 
