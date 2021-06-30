@@ -9,4 +9,9 @@
 /blocklm-1.5-generation*
 *.pyc
 selftest.py
+settings.json
+.gitignore
+logs
+runs
+*.pyc
 transformers/

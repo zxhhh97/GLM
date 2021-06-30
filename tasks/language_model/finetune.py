@@ -34,7 +34,13 @@ def lm_forward_step(data, model, args, timers, mems, eval_metric=None):
     """Forward step."""
 
     # Get the batch.
+    if timers is not None:
+        timers('batch generator').start()
+    if 'mask' in data:
+        data['attention_mask'] = data.pop('mask')
     tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data, args)
+    if timers is not None:
+        timers('batch generator').stop()
 
     def print_masked_text(batch_id):
         block_position_ids = position_ids[:, 1]
@@ -84,6 +90,7 @@ def lm_forward_step(data, model, args, timers, mems, eval_metric=None):
             loss = loss / loss_mask.sum()
         return loss, mems, 'bert'
     elif eval_metric == 'accuracy' or eval_metric == 'classify':
+        logits = mpu.gather_from_model_parallel_region(logits)
         outputs = torch.argmax(logits, -1)
         correct = (outputs == labels).float()
         correct[(1 - loss_mask).bool()] = 1
@@ -136,6 +143,9 @@ def evaluate(model, dataloader, eval_metric, args):
             total_output += output.item()
             total_count += count.item()
             total_tokens += batch['loss_mask'].sum().item()
+    totals = torch.cuda.FloatTensor([total_output, total_tokens])
+    torch.distributed.all_reduce(totals, group=mpu.get_data_parallel_group())
+    total_output, total_tokens = totals.tolist()
     print(total_tokens)
     return {eval_metric: total_output}, total_count
 

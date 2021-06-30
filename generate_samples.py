@@ -24,7 +24,7 @@ from arguments import get_args
 from pretrain_glm import initialize_distributed
 from pretrain_glm import set_random_seed
 from pretrain_glm import get_masks_and_position_ids
-from utils import load_checkpoint, get_checkpoint_iteration
+from utils import load_checkpoint
 from configure_data import prepare_tokenizer
 from generation_utils import BeamSearchScorer
 import mpu
@@ -245,7 +245,7 @@ def read_context(tokenizer, args, output):
     terminate_runs = terminate_runs_tensor[0].item()
 
     if terminate_runs == 1:
-        return terminate_runs, raw_text, None, None
+        return terminate_runs, None, None, None
 
     context_length_tensor = torch.cuda.LongTensor([context_length])
 
@@ -258,6 +258,8 @@ def read_context(tokenizer, args, output):
         context_tokens_tensor = torch.cuda.LongTensor([0] * context_length)
     torch.distributed.broadcast(context_tokens_tensor, mpu.get_model_parallel_src_rank(),
                                 group=mpu.get_model_parallel_group())
+    if mpu.get_model_parallel_rank() != 0:
+        raw_text = tokenizer.DecodeIds(context_tokens_tensor.tolist())
     return terminate_runs, raw_text, context_tokens_tensor, context_length
 
 

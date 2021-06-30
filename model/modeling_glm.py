@@ -20,6 +20,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import mpu
+from model.prompt import PromptSpell
+from utils import print_rank_0
 
 
 def init_method_normal(std=0.02):
@@ -58,7 +60,10 @@ class GLMModel(torch.nn.Module):
                  relative_encoding=False,
                  block_position_encoding=False,
                  output_predict=True,
-                 spell_length=None):
+                 spell_length=None,
+                 spell_func='lstm',
+                 attention_scale=1.0,
+                 ):
 
         super(GLMModel, self).__init__()
 
@@ -83,20 +88,21 @@ class GLMModel(torch.nn.Module):
                                                        output_dropout_prob,
                                                        checkpoint_activations,
                                                        checkpoint_num_layers,
+                                                       attention_scale=attention_scale,
                                                        relative_encoding=relative_encoding,
                                                        block_position_encoding=block_position_encoding)
         if spell_length is not None:
-            self.spell_length = spell_length
-            self.spell_embeddings = torch.nn.Embedding(self.spell_length, self.hidden_size)
-            self.lstm_head = torch.nn.LSTM(input_size=self.hidden_size,
-                                           hidden_size=self.hidden_size,
-                                           num_layers=2,
-                                           # dropout=self.lstm_dropout,
-                                           bidirectional=True,
-                                           batch_first=True)  # .to(torch.device("cuda"))
-            self.mlp_head = torch.nn.Sequential(torch.nn.Linear(2 * self.hidden_size, self.hidden_size),
-                                                torch.nn.ReLU(),
-                                                torch.nn.Linear(self.hidden_size, self.hidden_size))
+            self.prompt_spell = PromptSpell(spell_length, self.hidden_size, spell_func)
+
+    def freeze_transformer(self, tune_prefix_layers=None):
+        log_str = "Freeze transformer"
+        self.word_embeddings.requires_grad_(False)
+        self.transformer.requires_grad_(False)
+        if tune_prefix_layers is not None:
+            log_str += f" tune {tune_prefix_layers} prefix layers"
+            for i in range(tune_prefix_layers):
+                self.transformer.layers[i].requires_grad_(True)
+        print_rank_0(log_str)
 
     def forward(self, input_ids, position_ids, attention_mask, *mems, return_memory=False, detach_memory=True,
                 prompt_pos=None):
@@ -106,9 +112,7 @@ class GLMModel(torch.nn.Module):
         embeddings = words_embeddings
         if prompt_pos is not None:
             embeddings = embeddings.clone()
-            prompt_embeds = self.spell_embeddings.weight.unsqueeze(0)
-            prompt_embeds = self.lstm_head(prompt_embeds)[0]
-            prompt_embeds = self.mlp_head(prompt_embeds)
+            prompt_embeds = self.prompt_spell()
             batch_index = torch.arange(batch_size, device=input_ids.device).unsqueeze(1)
             embeddings[batch_index, prompt_pos] = prompt_embeds
         # Transformer.
@@ -213,13 +217,13 @@ def glm_get_params_for_weight_decay_optimization(module):
         if isinstance(module_, (mpu.LayerNorm, torch.nn.LayerNorm)):
             no_weight_decay_params['params'].extend(
                 [p for p in list(module_._parameters.values())
-                 if p is not None])
+                 if p is not None and p.requires_grad])
         else:
             weight_decay_params['params'].extend(
                 [p for n, p in list(module_._parameters.items())
-                 if p is not None and n != 'bias'])
+                 if p is not None and p.requires_grad and n != 'bias'])
             no_weight_decay_params['params'].extend(
                 [p for n, p in list(module_._parameters.items())
-                 if p is not None and n == 'bias'])
+                 if p is not None and p.requires_grad and n == 'bias'])
 
     return weight_decay_params, no_weight_decay_params

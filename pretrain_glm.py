@@ -20,14 +20,18 @@ from datetime import datetime
 import os
 import random
 import math
+
+import torch.distributed
+from filelock import FileLock
 import numpy as np
 import torch
 
 import deepspeed
 from contextlib import ExitStack
 from arguments import get_args
-from configure_data import configure_data, prepare_tokenizer
+from configure_data import configure_data, prepare_tokenizer, build_multi_task_dataset
 import mpu
+import pathlib
 
 from train_utils import setup_model_and_optimizer, train_step
 from utils import Timers
@@ -36,7 +40,7 @@ from utils import load_checkpoint
 from utils import report_memory
 from utils import print_and_save_args
 from utils import print_rank_0
-from utils import get_sample_writer, get_log_dir
+from utils import get_sample_writer, get_log_dir, get_hostname
 import torch.distributed as dist
 
 
@@ -206,36 +210,62 @@ def forward_step(data_iterator, model, args, timers, mems):
     # Get the batch.
     timers('batch generator').start()
     timers('data loader').start()
-    data = next(data_iterator) if data_iterator else None
+    rand = random.Random(args.iteration * mpu.get_data_parallel_world_size() + mpu.get_data_parallel_rank())
+    if data_iterator[1] and rand.random() < args.multi_task_ratio:
+        data = next(data_iterator[1]) if data_iterator[1] else None
+        data["mode"] = "multi-task"
+    else:
+        data = next(data_iterator[0]) if data_iterator[0] else None
+    # print_rank_0("data iterator")
     timers('data loader').stop()
     tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data, args)
     timers('batch generator').stop()
+
+    # print_rank_0("get batch")
+
+    def print_masked_text(batch_id):
+        block_position_ids = position_ids[:, 1]
+        position_ids_ = position_ids[:, 0]
+        sep = attention_mask.item() if torch.numel(attention_mask) == 1 else attention_mask[batch_id].item()
+        text, last_segment = "", []
+        for i, token_id in enumerate(tokens[batch_id, :sep].tolist()):
+            token = tokenizer.IdToToken(token_id)
+            if token.startswith('[MASK') or token.endswith('MASK]'):
+                if last_segment:
+                    text += tokenizer.DecodeIds(last_segment)
+                    last_segment = []
+                text += f" [{position_ids_[batch_id, i].item()}, {token}]"
+            else:
+                last_segment.append(token_id)
+        if last_segment:
+            text += tokenizer.DecodeIds(last_segment)
+        print(text.encode('utf-8'))
+        last_index = None
+        for i in range(sep, tokens.size(1)):
+            if tokenizer.IdToToken(tokens[batch_id, i].item()).startswith("<|startofpiece"):
+                if last_index is not None:
+                    print(tokenizer.DecodeIds(tokens[batch_id, last_index: i].tolist()).encode('utf-8'), "|",
+                          tokenizer.DecodeIds(labels[batch_id, last_index: i].tolist()).encode('utf-8'),
+                          position_ids_[batch_id, last_index: i].tolist(),
+                          block_position_ids[batch_id, last_index:i].tolist())
+                last_index = i
+        if last_index is not None:
+            print(tokenizer.DecodeIds(tokens[batch_id, last_index:].tolist()).encode('utf-8'), "|",
+                  tokenizer.DecodeIds(labels[batch_id, last_index:].tolist()).encode('utf-8'),
+                  position_ids_[batch_id, last_index:].tolist(), block_position_ids[batch_id, last_index:].tolist())
 
     if data is not None and "mode" in data:
         mode = data['mode']
     else:
         mode = 'bert'
 
-    # Forward model.
-    if args.nonautoregressive:
-        logits, na_logits, *mems = model(tokens, position_ids, attention_mask, *mems)
-        losses = mpu.vocab_parallel_cross_entropy(logits.contiguous().float(),
-                                                  labels)
-        loss_mask = loss_mask.view(-1)
-        loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
-
-        na_losses = mpu.vocab_parallel_cross_entropy(na_logits.contiguous().float(),
-                                                     labels)
-        na_loss = torch.sum(na_losses.view(-1) * loss_mask) / loss_mask.sum()
-        loss = loss + na_loss
-    else:
-        logits, *mems = model(tokens, position_ids, attention_mask, *mems)
-        losses = mpu.vocab_parallel_cross_entropy(logits.contiguous().float(),
-                                                  labels)
-        loss_mask = loss_mask.view(-1)
-        loss = torch.sum(losses.view(-1) * loss_mask)
-        if loss_mask.sum().item() > 0:
-            loss = loss / loss_mask.sum()
+    logits, *mems = model(tokens, position_ids, attention_mask, *mems)
+    losses = mpu.vocab_parallel_cross_entropy(logits.contiguous().float(),
+                                              labels)
+    loss_mask = loss_mask.view(-1)
+    loss = torch.sum(losses.view(-1) * loss_mask)
+    if loss_mask.sum().item() > 0:
+        loss = loss / loss_mask.sum()
 
     return loss, mems, mode
 
@@ -255,7 +285,7 @@ def report_iteration_metrics(summary_writer, optimizer, lr, loss, elapsed_time, 
         summary_writer.add_scalar(f'Train/elapsed_time', elapsed_time, step)
 
 
-def report_evaluate_metrics(summary_writer, prefix, loss, ppl, gpt_loss, bert_loss, sent_loss, step):
+def report_evaluate_metrics(summary_writer, prefix, loss, ppl, gpt_loss, bert_loss, sent_loss, multi_loss, step):
     string = ' validation loss at {}'.format(prefix)
     string += ' | LM loss: {:.6E}'.format(loss)
     string += ' | LM PPL: {:.6E}'.format(ppl)
@@ -265,6 +295,8 @@ def report_evaluate_metrics(summary_writer, prefix, loss, ppl, gpt_loss, bert_lo
         string += ' | BERT loss: {:.6E}'.format(bert_loss)
     if sent_loss != 0:
         string += ' | Sent loss: {:.6E}'.format(sent_loss)
+    if multi_loss != 0:
+        string += ' | Multi loss: {:.6E}'.format(multi_loss)
     length = len(string) + 1
     print_rank_0('-' * 100)
     print_rank_0('-' * length)
@@ -279,6 +311,8 @@ def report_evaluate_metrics(summary_writer, prefix, loss, ppl, gpt_loss, bert_lo
             summary_writer.add_scalar(f'Train/valid_bert_loss', bert_loss, step)
         if sent_loss != 0:
             summary_writer.add_scalar(f'Train/valid_sent_loss', sent_loss, step)
+        if multi_loss != 0:
+            summary_writer.add_scalar(f'Train/valid_multi_loss', multi_loss, step)
 
 
 def train(model, optimizer, lr_scheduler,
@@ -321,6 +355,13 @@ def train(model, optimizer, lr_scheduler,
             if report_memory_flag:
                 report_memory('after {} iterations'.format(args.iteration))
                 report_memory_flag = False
+            # for i in range(torch.distributed.get_world_size()):
+            #     if i == torch.distributed.get_rank():
+            #         print(get_hostname())
+            #         timers.log(['forward', 'backward', 'optimizer',
+            #                     'batch generator', 'data loader'],
+            #                    normalizer=args.log_interval, reset=False)
+            #     torch.distributed.barrier()
             if args.deepspeed or args.DDP_impl == 'torch':
                 timers.log(['forward', 'backward', 'optimizer',
                             'batch generator', 'data loader'],
@@ -348,8 +389,8 @@ def evaluate(data_iterator, model, args, timers, forward_step_func, verbose=Fals
     # Turn on evaluation mode which disables dropout.
     model.eval()
 
-    total_lm_loss, total_gpt_loss, total_bert_loss, total_sent_loss = 0, 0, 0, 0
-    gpt_iters, bert_iters, sent_iters = 0, 0, 0
+    total_lm_loss, total_gpt_loss, total_bert_loss, total_sent_loss, total_multi_loss = 0, 0, 0, 0, 0
+    gpt_iters, bert_iters, sent_iters, multi_iters = 0, 0, 0, 0
     mems = []
     with torch.no_grad():
         iteration = 0
@@ -378,29 +419,33 @@ def evaluate(data_iterator, model, args, timers, forward_step_func, verbose=Fals
             elif mode == 'sentence':
                 total_sent_loss += lm_loss
                 sent_iters += 1
-
+            elif mode == 'multi-task':
+                total_multi_loss += lm_loss
+                multi_iters += 1
     # Move model back to the train mode.
     model.train()
     # Reduce across processes.
     loss_data = torch.cuda.FloatTensor(
-        [total_lm_loss, total_gpt_loss, total_bert_loss, total_sent_loss, gpt_iters, bert_iters, sent_iters])
+        [total_lm_loss, total_gpt_loss, total_bert_loss, total_sent_loss, total_multi_loss, gpt_iters, bert_iters,
+         sent_iters, multi_iters])
     torch.distributed.all_reduce(loss_data, group=mpu.get_data_parallel_group())
     loss_data = loss_data.tolist()
     total_lm_loss = loss_data[0] / args.eval_iters / (args.world_size / args.model_parallel_size)
-    total_gpt_loss = loss_data[1] / loss_data[4] if loss_data[4] > 0 else 0
-    total_bert_loss = loss_data[2] / loss_data[5] if loss_data[5] > 0 else 0
-    total_sent_loss = loss_data[3] / loss_data[6] if loss_data[6] > 0 else 0
-    return total_lm_loss, total_gpt_loss, total_bert_loss, total_sent_loss
+    total_gpt_loss = loss_data[1] / loss_data[5] if loss_data[5] > 0 else 0
+    total_bert_loss = loss_data[2] / loss_data[6] if loss_data[6] > 0 else 0
+    total_sent_loss = loss_data[3] / loss_data[7] if loss_data[7] > 0 else 0
+    total_multi_loss = loss_data[4] / loss_data[8] if loss_data[8] > 0 else 0
+    return total_lm_loss, total_gpt_loss, total_bert_loss, total_sent_loss, total_multi_loss
 
 
 def evaluate_and_print_results(prefix, data_iterator, model,
                                args, timers, forward_step_func, verbose=False, step=None, summary_writer=None):
     """Helper function to evaluate and dump results on screen."""
-    lm_loss, gpt_loss, bert_loss, sent_loss = evaluate(data_iterator, model, args, timers, verbose=verbose,
-                                                       forward_step_func=forward_step_func)
+    lm_loss, gpt_loss, bert_loss, sent_loss, multi_loss = evaluate(data_iterator, model, args, timers, verbose=verbose,
+                                                                   forward_step_func=forward_step_func)
 
     lm_ppl = math.exp(min(20, lm_loss))
-    report_evaluate_metrics(summary_writer, prefix, lm_loss, lm_ppl, gpt_loss, bert_loss, sent_loss, step)
+    report_evaluate_metrics(summary_writer, prefix, lm_loss, lm_ppl, gpt_loss, bert_loss, sent_loss, multi_loss, step)
 
     return lm_loss
 
@@ -523,15 +568,16 @@ def main():
     global tokenizer
     tokenizer = prepare_tokenizer(args)
     train_data, val_data, test_data, = get_train_val_test_data(args, tokenizer)
+    multi_train_data, multi_val_data = None, None
+    if args.multi_task_ratio > 0.0:
+        multi_train_data, multi_val_data = build_multi_task_dataset(args, tokenizer)
 
     # Model, optimizer, and learning rate.
     model, optimizer, lr_scheduler = setup_model_and_optimizer(args)
 
     if args.load is not None:
-        for i in range(8):
-            if i == args.local_rank:
-                args.iteration = load_checkpoint(model, optimizer, lr_scheduler, args)
-            torch.distributed.barrier()
+        with FileLock(os.path.join(pathlib.Path.home(), "checkpoint_lock"), timeout=-1):
+            args.iteration = load_checkpoint(model, optimizer, lr_scheduler, args)
     else:
         args.iteration = 0
     torch.distributed.barrier()
@@ -549,22 +595,34 @@ def main():
 
     # Resume data loader if necessary.
     if args.resume_dataloader:
+        print_rank_0("Resume dataloader")
         if train_data is not None:
-            train_data.batch_sampler.start_iter = args.iteration % \
-                                                  len(train_data)
+            train_data.batch_sampler.start_iter = args.iteration % len(train_data)
         if val_data is not None:
-            start_iter_val = (args.train_iters // args.save_interval) * \
-                             args.eval_interval
-            val_data.batch_sampler.start_iter = start_iter_val % \
-                                                len(val_data)
+            start_iter_val = (args.iteration // args.eval_interval) * args.eval_iters
+            val_data.batch_sampler.start_iter = start_iter_val % len(val_data)
+        if multi_train_data is not None:
+            multi_train_data.batch_sampler.start_iter = int(args.iteration * args.multi_task_ratio) % len(
+                multi_train_data)
+        if multi_val_data is not None:
+            start_iter_val = (args.iteration // args.eval_interval) * args.eval_iters * args.multi_task_ratio
+            multi_val_data.batch_sampler.start_iter = start_iter_val % len(multi_val_data)
     if train_data is not None:
         train_data_iterator = iter(train_data)
     else:
         train_data_iterator = None
+    if multi_train_data is not None:
+        multi_train_iterator = iter(multi_train_data)
+    else:
+        multi_train_iterator = None
     if val_data is not None:
         val_data_iterator = iter(val_data)
     else:
         val_data_iterator = None
+    if multi_val_data is not None:
+        multi_val_iterator = iter(multi_val_data)
+    else:
+        multi_val_iterator = None
 
     # TODO: figure out how to properly set this especially when resuming training
     iteration = 0
@@ -577,8 +635,8 @@ def main():
                 # stack.callback(save_on_exit, args, model, optimizer, lr_scheduler)
                 iteration, skipped = train(model, optimizer,
                                            lr_scheduler,
-                                           train_data_iterator,
-                                           val_data_iterator,
+                                           (train_data_iterator, multi_train_iterator),
+                                           (val_data_iterator, multi_val_iterator),
                                            timers, args, summary_writer=summary_writer)
 
         if args.do_valid:
@@ -597,7 +655,7 @@ def main():
     if args.do_test:
         # Run on test data.
         prefix = 'the end of training for test data'
-        evaluate_and_print_results(prefix, test_data_iterator,
+        evaluate_and_print_results(prefix, (test_data_iterator, None),
                                    model, args, timers, verbose=True, forward_step_func=forward_step)
 
 

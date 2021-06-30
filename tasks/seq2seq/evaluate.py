@@ -7,6 +7,7 @@ import mpu
 from utils import print_rank_0
 from generation_utils import BeamSearchScorer, LogitsProcessorList, MinLengthLogitsProcessor, \
     NoRepeatNGramLogitsProcessor
+from rouge_score import rouge_scorer
 
 
 def _is_digit(w):
@@ -27,6 +28,8 @@ cnndm_tok_dict = {"(": "-LRB-", ")": "-RRB-",
 
 
 def fix_tokenization(text, dataset):
+    if dataset == 'cnn_dm_org':
+        return text
     if dataset == 'gigaword':
         text = text.replace('[UNK]', 'UNK')
         return text
@@ -149,6 +152,42 @@ def remove_duplicate(l_list, duplicate_rate):
     return r_list
 
 
+def rouge_metric(predictions, labels, examples, metric="rouge-1", duplicate_rate=0.7, dataset='cnn_dm'):
+    metric_dict = {"rouge-1": "rouge1", "rouge-2": "rouge2", "rouge-l": "rougeLsum"}
+    refs = [example.meta["ref"] for example in examples]
+    ref_list = []
+    for ref in refs:
+        ref = ref.strip().split('[SEP]')
+        ref = [fix_tokenization(sentence, dataset=dataset) for sentence in ref]
+        ref = "\n".join(ref)
+        ref_list.append(ref)
+    pred_list = []
+    for prediction in predictions:
+        buf = []
+        for sentence in prediction.strip().split("[SEP]"):
+            sentence = fix_tokenization(sentence, dataset=dataset)
+            if any(get_f1(sentence, s) > 1.0 for s in buf):
+                continue
+            s_len = len(sentence.split())
+            if s_len <= 4:
+                continue
+            buf.append(sentence)
+        if duplicate_rate and duplicate_rate < 1:
+            buf = remove_duplicate(buf, duplicate_rate)
+        line = "\n".join(buf)
+        pred_list.append(line)
+    if torch.distributed.get_rank() == 0:
+        import json
+        with open("./results.json", "w") as output:
+            for ref, pred in zip(ref_list, pred_list):
+                output.write(json.dumps({"ref": ref, "pred": pred}) + "\n")
+    scorer = rouge_scorer.RougeScorer([metric_dict[metric]], use_stemmer=True)
+    scores = [scorer.score(pred, ref) for pred, ref in zip(pred_list, ref_list)]
+    scores = [score[metric_dict[metric]].fmeasure for score in scores]
+    scores = sum(scores) / len(scores)
+    return scores
+
+
 def process_batch(batch, args):
     """Process batch and produce inputs for the model."""
     tokens = batch['text'].long().cuda()
@@ -176,7 +215,8 @@ class DecoderEvaluater:
         """Calculate correct over total answers and return prediction if the
         `output_predictions` is true."""
         model.eval()
-        store = torch.distributed.TCPStore(args.master_ip, 18931 + random.randint(0, 10000), mpu.get_data_parallel_world_size(),
+        store = torch.distributed.TCPStore(args.master_ip, 18931 + random.randint(0, 10000),
+                                           mpu.get_data_parallel_world_size(),
                                            torch.distributed.get_rank() == 0, datetime.timedelta(seconds=30))
         print_rank_0("Distributed store created")
         with torch.no_grad():
@@ -295,11 +335,13 @@ def blanklm_fix_tokenization(text):
     text = text.replace("e . g .", "e.g.")
     return text
 
+
 class BlankLMEvaluater(DecoderEvaluater):
 
     def evaluate(self, model, dataloader, example_dict, args):
         model.eval()
-        store = torch.distributed.TCPStore(args.master_ip, 18931 + random.randint(0, 10000), mpu.get_data_parallel_world_size(),
+        store = torch.distributed.TCPStore(args.master_ip, 18931 + random.randint(0, 10000),
+                                           mpu.get_data_parallel_world_size(),
                                            torch.distributed.get_rank() == 0, datetime.timedelta(seconds=30))
         print_rank_0("Distributed store created")
 
@@ -395,4 +437,3 @@ class BlankLMEvaluater(DecoderEvaluater):
             examples.append(example)
         torch.distributed.barrier()
         return predictions, [], examples
-

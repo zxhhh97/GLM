@@ -6,7 +6,6 @@ scipy
 nltk
 regex
 tqdm
-torch_scatter
 matplotlib
 mpi4py
 pandas
@@ -20,3 +19,8 @@ tensorboardX
 termcolor
 tldextract
 transformers
+<<<<<<< HEAD
+=======
+rouge_score
+fasttext
+>>>>>>> d43359ee572b4d3870c4bf0b1d270e616636ad8a

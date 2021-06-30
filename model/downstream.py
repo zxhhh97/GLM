@@ -1,4 +1,3 @@
-
 """Multiple choice model."""
 
 import torch
@@ -13,10 +12,20 @@ class GLMForMultiTokenCloze(torch.nn.Module):
         self.take_softmax = take_softmax
         self.length_penalty = length_penalty
 
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        # [h.remove() for h in self.hook_handles]
+        sd = self.model.state_dict(destination, prefix, keep_vars)
+        return sd
+
+    def load_state_dict(self, state_dict, strict=True):
+        return self.model.load_state_dict(state_dict, strict=strict)
+
+    def named_parameters(self, prefix: str = '', recurse: bool = True):
+        return self.model.named_parameters(prefix=prefix, recurse=recurse)
+
     def forward(self, input_ids, position_ids, attention_mask, target_ids=None, logit_mask=None, prompt_pos=None):
         if target_ids == None:
-            outputs, *mems = self.model(input_ids, position_ids, attention_mask)
-            return (outputs, *mems)
+            return self.model(input_ids, position_ids, attention_mask)
         num_choices = None
         if len(input_ids.shape) == 3:
             batch_size, num_choices = input_ids.shape[:2]
@@ -68,6 +77,7 @@ class GLMForMultiTokenClozeFast(torch.nn.Module):
             m = enc_mems[0].new_ones((1, seq_length, seq_length))
             m = torch.tril(m)
 
+            # sep = dec_attention_mask
             ids = torch.arange(memory_length, device=sep.device, dtype=sep.dtype).view(1, -1)
             mask = ids < sep.view(-1, 1)  # batch * mem
             mask = mask.unsqueeze(1).float().expand(-1, seq_length, -1)
@@ -79,6 +89,7 @@ class GLMForMultiTokenClozeFast(torch.nn.Module):
 
         dec_input_ids = dec_input_ids.reshape(-1, max_dec_len)
         dec_position_ids = dec_position_ids.reshape(-1, *dec_position_ids.size()[2:])
+        # dec_attention_mask = dec_attention_mask.reshape(-1, *dec_attention_mask.size()[2:]).unsqueeze(1)
         dec_attention_mask = build_dec_mask_matrix(max_dec_len, dec_attention_mask.reshape(-1), max_enc_len)
         dec_target_ids = dec_target_ids.reshape(-1, dec_target_ids.size(-1))
         dec_logit_mask = dec_logit_mask.reshape(-1, dec_logit_mask.size(-1))
@@ -101,19 +112,37 @@ class GLMForMultiTokenClozeFast(torch.nn.Module):
 
 
 class GLMForSingleTokenCloze(torch.nn.Module):
-    def __init__(self, language_model):
+    def __init__(self, language_model, take_softmax=False):
         super().__init__()
         self.model = language_model
+        self.take_softmax = take_softmax
 
-    def forward(self, input_ids, position_ids, attention_mask, target_ids, logit_mask, prompt_pos=None):
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        # [h.remove() for h in self.hook_handles]
+        sd = self.model.state_dict(destination, prefix, keep_vars)
+        return sd
+
+    def load_state_dict(self, state_dict, strict=True):
+        return self.model.load_state_dict(state_dict, strict=strict)
+
+    def named_parameters(self, prefix: str = '', recurse: bool = True):
+        return self.model.named_parameters(prefix=prefix, recurse=recurse)
+
+    def forward(self, input_ids, position_ids, attention_mask, target_ids=None, logit_mask=None, prompt_pos=None):
+        if target_ids is None:
+            return self.model(input_ids, position_ids, attention_mask)
         assert len(input_ids.shape) == 2
         outputs, *mems = self.model(input_ids, position_ids, attention_mask, prompt_pos=prompt_pos)
         batch_ids = torch.arange(outputs.size(0), dtype=attention_mask.dtype, device=attention_mask.device)
-        target_output = outputs[batch_ids, attention_mask]
+        target_logits = outputs[batch_ids, attention_mask]
+        if self.take_softmax:
+            target_prob = torch.nn.functional.log_softmax(target_logits, dim=-1)
+        else:
+            target_prob = target_logits
         batch_ids = batch_ids.unsqueeze(1).expand_as(target_ids)
-        output = target_output[batch_ids, target_ids]
+        output = target_prob[batch_ids, target_ids]
 
-        return (output, *mems)
+        return (output, target_logits, *mems)
 
 
 class GLMForSequenceClassification(torch.nn.Module):

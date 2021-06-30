@@ -203,7 +203,7 @@ def build_decoder_input(enc_ids, answer_ids, max_seq_length, max_dec_seq_length,
     mask_position = enc_ids.index(mask_id)
     len_answer = len(answer_ids)
     ids = [sop_id] + answer_ids[:-1]
-    types = [0] * len_answer # not used
+    types = [0] * len_answer  # not used
     paddings = [1] * len_answer
     position_ids = [mask_position] * len_answer
     block_position_ids = list(range(1, len_answer + 1))
@@ -221,7 +221,7 @@ def build_decoder_input(enc_ids, answer_ids, max_seq_length, max_dec_seq_length,
         loss_masks.extend([0] * padding_length)
     position_ids = [position_ids, block_position_ids]
     return ids, types, paddings, position_ids, masks, target_ids, loss_masks
-    
+
 
 def build_sample(ids, types=None, paddings=None, positions=None, masks=None, label=None, unique_id=None, target=None,
                  logit_mask=None, segment_ids=None, prompt_ids=None):
@@ -257,6 +257,7 @@ def build_sample(ids, types=None, paddings=None, positions=None, masks=None, lab
         sample['uid'] = unique_id
     return sample
 
+
 def build_decoder_sample(sample, dec_ids, dec_position, dec_masks, dec_target, dec_logit_mask):
     sample['dec_text'] = np.array(dec_ids)
     sample['dec_position'] = np.array(dec_position)
@@ -264,6 +265,7 @@ def build_decoder_sample(sample, dec_ids, dec_position, dec_masks, dec_target, d
     sample['dec_target'] = np.array(dec_target)
     sample['dec_logit_mask'] = np.array(dec_logit_mask)
     return sample
+
 
 def my_collate(batch):
     new_batch = [{key: value for key, value in sample.items() if key != 'uid'} for sample in batch]
@@ -276,16 +278,15 @@ def my_collate(batch):
 
     if len(text_list[0].shape) == 2:
         choice_nums = list(map(len, text_list))
-        if choice_nums.count(choice_nums[0]) != len(choice_nums):
-            max_choice_num = max(choice_nums)
-            for i, sample in enumerate(new_batch):
-                for key, value in sample.items():
-                    if key != 'label':
-                        sample[key] = pad_choice_dim(value, max_choice_num)
-                    else:
-                        sample[key] = value
-                sample['loss_mask'] = np.array([1] * choice_nums[i] + [0] * (max_choice_num - choice_nums[i]),
-                                               dtype=np.float32)
+        max_choice_num = max(choice_nums)
+        for i, sample in enumerate(new_batch):
+            for key, value in sample.items():
+                if key != 'label':
+                    sample[key] = pad_choice_dim(value, max_choice_num)
+                else:
+                    sample[key] = value
+            sample['loss_mask'] = np.array([1] * choice_nums[i] + [0] * (max_choice_num - choice_nums[i]),
+                                           dtype=np.int64)
 
     if 'dec_text' in new_batch[0]:
         choice_nums = [len(sample['dec_text']) for sample in new_batch]
@@ -296,13 +297,26 @@ def my_collate(batch):
                     if key.startswith('dec_'):
                         sample[key] = pad_choice_dim(value, max_choice_num)
                 sample['loss_mask'] = np.array([1] * choice_nums[i] + [0] * (max_choice_num - choice_nums[i]),
-                                               dtype=np.float32)
+                                               dtype=np.int64)
 
     new_batch = default_collate(new_batch)
     if 'uid' in batch[0]:
         uid_list = [sample['uid'] for sample in batch]
         new_batch['uid'] = uid_list
     return new_batch
+
+
+class FakeDataloader:
+    def __init__(self, num_iters):
+        self.num_iters = num_iters
+
+    def __iter__(self):
+        if self.num_iters is not None:
+            for _ in range(self.num_iters):
+                yield None
+        else:
+            while True:
+                yield None
 
 
 def build_data_loader(dataset, batch_size, num_workers, drop_last, shuffle=True, only_rank0=False):

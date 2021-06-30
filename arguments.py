@@ -100,7 +100,7 @@ def add_fp16_config_args(parser):
                        help='Window over which to raise/lower dynamic scale')
     group.add_argument('--min-scale', type=float, default=1,
                        help='Minimum loss scale for dynamic loss scale')
-
+    group.add_argument('--attention-scale', type=float, default=1.0)
     return parser
 
 
@@ -128,7 +128,7 @@ def add_training_args(parser):
                        help='Number of finetunning epochs. Zero results in evaluation only.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='gradient clipping')
-    group.add_argument('--train-iters', type=int, default=1000000,
+    group.add_argument('--train-iters', type=int, default=0,
                        help='total number of iterations to train over all training runs')
     group.add_argument('--label-smoothing', type=float, default=0.0)
     group.add_argument('--log-interval', type=int, default=100,
@@ -174,6 +174,9 @@ def add_training_args(parser):
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true',
                        help='Do not load rng state when loading checkpoint.')
+    group.add_argument('--no-load-lr-scheduler', action='store_true',
+                       help='Do not load lr scheduler when loading checkpoint.')
+    group.add_argument('--no-deepspeed-load', action='store_true', help='Not use deepspeed when loading checkpoint')
     group.add_argument('--finetune', action='store_true',
                        help='Load model for finetuning. Do not load optimizer '
                             'or rng state from checkpoint and set iteration to 0. '
@@ -198,7 +201,10 @@ def add_training_args(parser):
     group.add_argument('--gpt-infill-prob', type=float, default=0.5)
     group.add_argument('--gpt-min-ratio', type=float, default=0.5)
     group.add_argument('--gap-sentence-prob', type=float, default=0.0)
+    group.add_argument('--gap-sentence-ratio', type=float, default=0.15)
     group.add_argument('--avg-block-length', type=int, default=3)
+    group.add_argument('--short-seq-prob', type=float, default=0.0)
+    group.add_argument('--single-span-prob', type=float, default=0.0)
     group.add_argument('--task-mask', action='store_true', help="Use different mask for generation and blank filling")
     group.add_argument('--no-shuffle-block', action='store_true', help="not shuffle the blocks when filling the blank")
     group.add_argument('--no-block-position', action='store_true',
@@ -209,7 +215,6 @@ def add_training_args(parser):
     group.add_argument('--context-mask-ratio', type=float, default=0.0)
     group.add_argument('--random-position', action='store_true',
                        help="Use random start position to cover all the position embeddings")
-    group.add_argument('--nonautoregressive', action='store_true', help="whether add a non-autoregressive loss")
     return parser
 
 
@@ -267,6 +272,7 @@ def add_data_args(parser):
     group.add_argument('--shuffle', action='store_true',
                        help='Shuffle data. Shuffling is deterministic '
                             'based on seed and current epoch.')
+    group.add_argument('--filter-english', action='store_true')
     group.add_argument('--train-data', nargs='+', default=None,
                        help='Whitespace separated filenames or corpora names '
                             'for training.')
@@ -289,8 +295,10 @@ def add_data_args(parser):
                        help='comma-separated list of proportions for training,'
                             ' validation, and test split')
 
-    group.add_argument('--lazy-loader', action='store_true',
+    group.add_argument('--no-lazy-loader', action='store_true',
                        help='whether to lazy read the data set')
+    group.add_argument('--half-lazy-loader', action='store_true')
+    group.add_argument('--loader-scatter', type=int, default=None, help='Number of scatters to use for dataloaders')
     group.add_argument('--loose-json', action='store_true',
                        help='Use loose json (one json-formatted string per '
                             'newline), instead of tight json (data file is one '
@@ -332,10 +340,16 @@ def add_data_args(parser):
                        help='Maximum number of predictions to use per sequence.'
                             'Defaults to math.ceil(`--seq-length`*.15/10)*10.'
                             'MUST BE SPECIFIED IF `--use-tfrecords` is True.')
+    group.add_argument('--non-sentence-start', type=float, default=0.0)
     group.add_argument('--sample-one-document', action='store_true', help='only sample one document in one sample')
     group.add_argument('--load-splits', type=str, default=None, help="The path to load split indices from")
     group.add_argument('--save-splits', type=str, default=None, help="The path to save split indices to")
     group.add_argument('--save-test-data', type=str, default=None, help="The path to save the test data")
+    group.add_argument('--multi-task-data', nargs='*', default=None,
+                       help="Downsteam task names for multi-task pre-training")
+    group.add_argument('--multi-task-ratio', type=float, default=0.0, help="Ratio for multi-task pre-training")
+    group.add_argument('--multi-seq-length', type=int, default=None)
+    group.add_argument('--multi-batch-size', type=int, default=None)
     return parser
 
 
@@ -345,14 +359,17 @@ def add_finetune_config_args(parser):
     group.add_argument('--load-pretrained', type=str, help="Load pretrained model", default=None)
     group.add_argument('--pool-token', type=str, choices=['start', 'pad', 'cls'],
                        help='The token to pool the sequence representation', default='cls')
-    group.add_argument('--continuous-prompt', action='store_true', help="Use continuous prompt for PET")
     group.add_argument('--cloze-eval', action='store_true', help='Evaluation dataset with cloze task')
+    group.add_argument('--multi-token', action='store_true', help='Use multi token for cloze evaluation')
     group.add_argument('--segment-length', type=int, default=0, help="The maximum segment length for cloze evaluation")
     group.add_argument('--loss-func', type=str, choices=["cross_entropy", "hinge", "generative", "mix"],
                        default="cross_entropy")
+    group.add_argument('--block-lm-ratio', type=float, default=0.0)
+    group.add_argument('--adapet', action='store_true', help="Use the decoupled cross entropy loss in AdaPET")
     group.add_argument('--pattern-id', type=int, default=0)
     group.add_argument('--fast-decode', action='store_true',
                        help="Fast decode for multi-token cloze. Can only be used without checkpoint activation.")
+    group.add_argument('--few-superglue', action='store_true')
     group.add_argument('--eval-valid', action='store_true', help="Whether evaluate on the valid set")
     group.add_argument('--validation-metric', type=str, default=None)
     group.add_argument('--unidirectional', action='store_true', help="Use the left to right language model")
@@ -365,7 +382,14 @@ def add_finetune_config_args(parser):
     group.add_argument('--wsc-negative', action='store_true')
     group.add_argument('--overwrite', action='store_true')
     group.add_argument('--no-validation', action='store_true')
-    group.add_argument('--start-validation', action='store_true')
+    # Continuous prompt arguments
+    group.add_argument('--continuous-prompt', action='store_true', help="Use continuous prompt for PET")
+    group.add_argument('--num-prompt-tokens', type=int, default=0)
+    group.add_argument('--prompt-func', default='lstm', choices=["lstm", "mlp", "none"])
+    group.add_argument('--freeze-transformer', action='store_true', default=False)
+    group.add_argument('--tune-prefix-layers', type=int, default=None)
+    group.add_argument('--prefix-prompt', type=int, default=0)
+    group.add_argument('--prompt-init', action='store_true', default=False)
     return parser
 
 def add_api_args(parser):

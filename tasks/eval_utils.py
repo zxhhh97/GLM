@@ -17,10 +17,12 @@
 
 import os
 import time
-import json
+import random
 import torch
+import datetime
 
-from utils import print_rank_0
+import mpu
+from utils import print_rank_0, get_spare_port, debug_finetune_data
 from tasks.data_utils import build_data_loader
 from finetune_glm import process_batch
 from collections import OrderedDict
@@ -45,10 +47,15 @@ def f1_macro_metric(predictions, labels, examples):
     return f1_score(labels, predictions, average='macro')
 
 
+global_tokenizer = None
+
+
 def accuracy_func_provider(single_dataset_provider, metric_dict, args, is_test=False, eval_func=None, output_func=None,
-                           only_rank0=True):
+                           only_rank0=True, tokenizer=None):
     """Provide function that calculates accuracies."""
     # Build dataloaders.
+    global global_tokenizer
+    global_tokenizer = tokenizer
     if only_rank0 and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
         return None
     if is_test and not args.eval_valid:
@@ -113,20 +120,26 @@ def multichoice_evaluate(model, dataloader, example_dict, args):
     """Calculate correct over total answers and return prediction if the
     `output_predictions` is true."""
     model.eval()
+    port = get_spare_port(args)
+    print_rank_0(f"Using port {port}")
+    store = torch.distributed.TCPStore(args.master_ip, port,
+                                       torch.distributed.get_world_size(),
+                                       torch.distributed.get_rank() == 0, datetime.timedelta(seconds=30))
+    # file_path = os.path.join("/cache", args.experiment_name + "_store")
+    # print_rank_0(f"Using file store at {file_path}")
+    # store = torch.distributed.FileStore(file_path, torch.distributed.get_world_size())
     with torch.no_grad():
         # For all the batches in the dataset.
-        predictions, labels, examples = [], [], []
         for _, batch in enumerate(dataloader):
             # Run the model forward.
             data = process_batch(batch, args)
             if args.pretrained_bert:
                 tokens, types, labels_, attention_mask = data['text'], data['types'], data['label'], data[
-                    'attention_mask']
+                    'padding_mask']
                 inputs = [tokens, types, attention_mask]
             elif args.cloze_eval:
                 tokens, labels_, position_ids = data['text'], data['label'], data['position']
-                attention_mask, target_ids, logit_mask = data['attention_mask'], data.get('target'), data.get(
-                    'logit_mask')
+                attention_mask, target_ids, logit_mask = data['mask'], data['target'], data['logit_mask']
                 if not args.fast_decode:
                     inputs = [tokens, position_ids, attention_mask, target_ids, logit_mask]
                     if args.continuous_prompt:
@@ -140,7 +153,7 @@ def multichoice_evaluate(model, dataloader, example_dict, args):
                               dec_target_ids, dec_logit_mask]
             else:
                 tokens, labels_, position_ids, attention_mask = data['text'], data['label'], data['position'], data[
-                    'attention_mask']
+                    'mask']
                 inputs = [tokens, position_ids, attention_mask]
             if len(inputs[0].shape) == 3 and inputs[0].size(1) > segment_length:
                 logit_list = []
@@ -177,15 +190,20 @@ def multichoice_evaluate(model, dataloader, example_dict, args):
             uid_list = batch['uid']
             if isinstance(uid_list, torch.Tensor):
                 uid_list = uid_list.cpu().numpy().tolist()
-            if example_dict is not None:
-                example_batch = [example_dict[uid] for uid in uid_list]
-                examples.extend(example_batch)
-            # Compute the correct answers.
             predicted = torch.argmax(logits, dim=-1).tolist()
-            # Add output predictions.
-            predictions.extend(predicted)
-            labels.extend(labels_.tolist())
-    if args.task.lower() == 'wsc':
-        predictions = [1 if pred == 0 else 0 for pred in predictions]
+            labels = labels_.tolist()
+            if args.task.lower() == 'wsc':
+                predicted = [1 if pred == 0 else 0 for pred in predicted]
+            if mpu.get_model_parallel_rank() == 0:
+                for uid, prediction, label in zip(uid_list, predicted, labels):
+                    store.set(uid, str((prediction, label)))
     model.train()
+    torch.distributed.barrier()
+    predictions, labels, examples = [], [], []
+    for uid, example in example_dict.items():
+        prediction, label = eval(store.get(uid))
+        predictions.append(prediction)
+        labels.append(label)
+        examples.append(example)
+    torch.distributed.barrier()
     return predictions, labels, examples

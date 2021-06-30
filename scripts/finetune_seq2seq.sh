@@ -1,33 +1,33 @@
 DATA_ROOT=/root/data
-CHECKPOINT_PATH=/root/data/checkpoints
+CHECKPOINT_PATH="/dataset/c07bd62b/finetune_checkpoints"
 SAVE_PATH=/root/data/finetune_checkpoints
 DATESTR=$(date +"%m-%d-%H-%M")
 
 source $1    # Model
 source $2    # Task
 
-export NCCL_DEBUG=info
-export NCCL_IB_DISABLE=0
-export NCCL_SOCKET_IFNAME=bond0
-export NCCL_IB_GID_INDEX=3
-export NCCL_NET_GDR_LEVEL=2
-export PATH="/opt/conda/bin:$PATH"
-
-NUM_WORKERS=2
+NUM_WORKERS=1
 NUM_GPUS_PER_WORKER=8
+MP_SIZE=1
 MASTER_PORT=$(shuf -n 1 -i 10000-65535)
-HOST_FILE_PATH="/root/code/config/hostfile"
 
+OPTIONS_NCCL="NCCL_DEBUG=info NCCL_IB_DISABLE=0 NCCL_NET_GDR_LEVEL=2"
+DISTRIBUTED_ARGS="${OPTIONS_NCCL} deepspeed --master_port $MASTER_PORT --num_nodes ${NUM_WORKERS} --num_gpus ${NUM_GPUS_PER_WORKER}"
+
+EXPERIMENT_NAME=${EXPERIMENT_NAME}_${DATESTR}
 mkdir logs
-deepspeed --master_port ${MASTER_PORT} --num_nodes ${NUM_WORKERS} --num_gpus ${NUM_GPUS_PER_WORKER} --hostfile ${HOST_FILE_PATH} finetune_glm.py \
+run_cmd="${DISTRIBUTED_ARGS} finetune_glm.py \
        --finetune \
        --experiment-name ${EXPERIMENT_NAME} \
        --task ${TASK_NAME} \
        --data-dir ${DATA_PATH} \
-       --save ${SAVE_PATH} \
+       --save ${CHECKPOINT_PATH} \
        --checkpoint-activations \
        $MODEL_ARGS \
        $TRAIN_ARGS \
        $COMMON_ARGS \
        $TASK_ARGS \
-       2>&1 | tee logs/log-${DATESTR}.txt
+       2>&1 | tee logs/log-${EXPERIMENT_NAME}.txt"
+
+echo ${run_cmd}
+eval ${run_cmd}

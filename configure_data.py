@@ -15,15 +15,81 @@
 
 """parses arguments and preps data loader"""
 
+import os
 import copy
+import random
+import numpy as np
 import torch
 import torch.utils.data
 import data_utils
 from blocklm_utils import ConstructBlockStrategy
 from data_utils.tokenization import make_tokenizer
 from utils import print_rank_0
+from itertools import accumulate
+from bisect import bisect_right
+from tasks.superglue.dataset import SuperGlueDataset
 
 import mpu
+
+
+class MultiTaskDataset(torch.utils.data.Dataset):
+    def __init__(self, tasks, datasets, reweight=True, temperature=0.8, max_limit=200000):
+        super(MultiTaskDataset, self).__init__()
+        self.tasks = tasks
+        self.datasets = datasets
+        self.reweight = reweight
+        self.temperature = temperature
+        self.lens = [len(dataset) for dataset in datasets]
+        self.weights = np.array([min(l, max_limit) ** temperature for l in self.lens])
+        self.total_len = sum(self.lens)
+        self.cumulative_lens = list(accumulate(self.lens))
+        if self.reweight:
+            print_rank_0(list(zip(self.tasks, self.lens, self.weights)))
+        else:
+            print_rank_0(list(zip(self.tasks, self.lens)))
+        self.weights /= self.weights.sum()
+
+    def __len__(self):
+        return self.total_len * 1000
+
+    @staticmethod
+    def pet_wrapper(data):
+        text = data['text']
+        loss_mask = data['logit_mask']
+        target = data['target']
+        attention_mask = data['mask']
+        position_id = data['position']
+        label = data['label']
+        if len(text.shape) == 2:
+            text = text[label]
+            loss_mask = loss_mask[label]
+            target = target[label]
+            attention_mask = attention_mask[label]
+            position_id = position_id[label]
+        else:
+            target = target[label]
+        if not target.shape:
+            target = target.repeat(len(text))
+        return {'text': text, 'target': target, 'loss_mask': loss_mask, 'position_id': position_id,
+                'attention_mask': attention_mask}
+
+    def __getitem__(self, idx):
+        if self.reweight:
+            rng = random.Random(idx)
+            rng = np.random.RandomState(seed=[rng.randint(0, 2 ** 32 - 1) for _ in range(16)])
+            dataset_idx = rng.choice(np.arange(len(self.datasets)), p=self.weights)
+            dataset = self.datasets[dataset_idx]
+            sample_idx = rng.choice(np.arange(len(dataset)))
+            item = self.datasets[dataset_idx][sample_idx]
+        else:
+            dataset_idx = bisect_right(self.cumulative_lens, idx)
+            if dataset_idx == 0:
+                sample_idx = idx
+            else:
+                sample_idx = idx - self.cumulative_lens[dataset_idx - 1]
+            item = self.datasets[dataset_idx][sample_idx]
+        item = self.pet_wrapper(item)
+        return item
 
 
 class DataConfig:
@@ -65,8 +131,7 @@ def prepare_tokenizer(args):
         assert eod_token == tokenizer.get_command('pad').Id
         before = num_tokens
         after = before
-        multiple = args.make_vocab_size_divisible_by * \
-                   mpu.get_model_parallel_world_size()
+        multiple = args.make_vocab_size_divisible_by
         while (after % multiple) != 0:
             after += 1
         print_rank_0('> padded vocab (size: {}) with {} dummy '
@@ -85,10 +150,13 @@ def prepare_tokenizer(args):
     return tokenizer
 
 
-def make_data_loader(dataset, tokenizer, batch_size, num_iters, args):
-    world_size = torch.distributed.get_world_size(
-        group=mpu.get_data_parallel_group())
+def make_data_loader(dataset, tokenizer, batch_size, num_iters, args, shuffle=False, block_collate=False):
+    world_size = torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
     rank = torch.distributed.get_rank(group=mpu.get_data_parallel_group())
+    if args.loader_scatter is not None:
+        rank = rank // args.loader_scatter
+        world_size = world_size // args.loader_scatter
+        batch_size = batch_size // args.loader_scatter
     distributed = world_size > 1
     if args.transformer_xl:
         batch_sampler = data_utils.samplers.DistributedSequentialSampler(len(dataset),
@@ -97,10 +165,9 @@ def make_data_loader(dataset, tokenizer, batch_size, num_iters, args):
                                                                          rank,
                                                                          world_size)
     else:
-        shuffle = args.shuffle
         if shuffle:
             sampler = data_utils.samplers.RandomSampler(dataset, replacement=True,
-                                                        num_samples=batch_size * args.train_iters)
+                                                        num_samples=batch_size * args.train_iters * args.gradient_accumulation_steps)
         else:
             sampler = torch.utils.data.SequentialSampler(dataset)
         drop_last = distributed
@@ -113,26 +180,29 @@ def make_data_loader(dataset, tokenizer, batch_size, num_iters, args):
             batch_sampler = torch.utils.data.BatchSampler(sampler,
                                                           batch_size,
                                                           drop_last)
-    use_block = args.block_lm or args.encoder_decoder
-    if use_block:
-        strategy = ConstructBlockStrategy(args, tokenizer, args.max_position_embeddings, bert_prob=args.bert_prob,
-                                          gap_sentence_prob=args.gap_sentence_prob,
-                                          gpt_infill_prob=args.gpt_infill_prob,
-                                          average_block_length=args.avg_block_length,
-                                          gpt_min_ratio=args.gpt_min_ratio,
-                                          block_mask_prob=args.block_mask_prob,
-                                          context_mask_ratio=args.context_mask_ratio,
-                                          shuffle_blocks=not args.no_shuffle_block,
-                                          block_position_encoding=not args.no_block_position,
-                                          sentinel_token=args.sentinel_token,
-                                          encoder_decoder=args.encoder_decoder,
-                                          task_mask=args.task_mask, random_position=args.random_position,
-                                          masked_lm=args.masked_lm)
+    collate_fn = None
+    if block_collate:
+        collate_fn = ConstructBlockStrategy(args, tokenizer, args.seq_length, bert_prob=args.bert_prob,
+                                            gap_sentence_prob=args.gap_sentence_prob,
+                                            gap_sentence_ratio=args.gap_sentence_ratio,
+                                            gpt_infill_prob=args.gpt_infill_prob,
+                                            average_block_length=args.avg_block_length,
+                                            gpt_min_ratio=args.gpt_min_ratio,
+                                            block_mask_prob=args.block_mask_prob,
+                                            context_mask_ratio=args.context_mask_ratio,
+                                            short_seq_prob=args.short_seq_prob,
+                                            single_span_prob=args.single_span_prob,
+                                            shuffle_blocks=not args.no_shuffle_block,
+                                            block_position_encoding=not args.no_block_position,
+                                            sentinel_token=args.sentinel_token,
+                                            encoder_decoder=args.encoder_decoder,
+                                            task_mask=args.task_mask, random_position=args.random_position,
+                                            masked_lm=args.masked_lm).construct_blocks
     data_loader = torch.utils.data.DataLoader(dataset,
                                               batch_sampler=batch_sampler,
                                               num_workers=args.num_workers,
                                               pin_memory=True,
-                                              collate_fn=strategy.construct_blocks if use_block else None)
+                                              collate_fn=collate_fn)
 
     return data_loader
 
@@ -179,8 +249,9 @@ def make_loaders(args, tokenizer):
 
     if args.use_tfrecords:
         return make_tfrecord_loaders(args)
-    world_size = torch.distributed.get_world_size(
-        group=mpu.get_data_parallel_group())
+    world_size = torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+    if args.loader_scatter is not None:
+        assert world_size % args.loader_scatter == 0
     batch_size = args.batch_size * world_size
     eval_batch_size = batch_size
     if args.eval_batch_size is not None:
@@ -205,11 +276,17 @@ def make_loaders(args, tokenizer):
         'max_preds_per_seq': args.max_preds_per_seq,
         'presplit_sentences': args.presplit_sentences,
         'sample_one_document': args.sample_one_document,
+        'filter_english': args.filter_english,
         'pre_tokenize': not args.no_pre_tokenize,
         'tokenizer': tokenizer,
         'save_splits': args.save_splits,
         'load_splits': args.load_splits,
-        'save_test_data': args.save_test_data
+        'save_test_data': args.save_test_data,
+        'no_lazy_loader': args.no_lazy_loader,
+        'loader_scatter': args.loader_scatter,
+        'data_parallel_rank': mpu.get_data_parallel_rank(),
+        "non_sentence_start": args.non_sentence_start,
+        "half_lazy_loader": args.half_lazy_loader
     }
 
     eval_set_args = copy.copy(data_set_args)
@@ -242,24 +319,57 @@ def make_loaders(args, tokenizer):
         test = data_utils.make_dataset(**eval_set_args)
 
     # wrap datasets with data loader
+    use_block = args.block_lm or args.encoder_decoder
+
     if train is not None and args.batch_size > 0:
-        train = make_data_loader(train, tokenizer, batch_size, args.train_iters, args)
+        train = make_data_loader(train, tokenizer, batch_size, args.train_iters, args, shuffle=args.shuffle,
+                                 block_collate=use_block)
         args.do_train = True
     else:
         args.do_train = False
     eval_batch_size = eval_batch_size if eval_batch_size != 0 else batch_size
     if valid is not None:
-        valid = make_data_loader(valid, tokenizer, eval_batch_size, args.train_iters, args)
+        valid = make_data_loader(valid, tokenizer, eval_batch_size, args.train_iters, args, shuffle=args.shuffle,
+                                 block_collate=use_block)
         args.do_valid = True
     else:
         args.do_valid = False
     if test is not None:
-        test = make_data_loader(test, tokenizer, eval_batch_size, len(test) // eval_batch_size + 1, args)
+        test = make_data_loader(test, tokenizer, eval_batch_size, len(test) // eval_batch_size + 1, args,
+                                shuffle=args.shuffle, block_collate=use_block)
         args.do_test = True
     else:
         args.do_test = False
 
     return train, valid, test
+
+
+def build_multi_task_dataset(args, tokenizer):
+    task_dirs = {"mnli": "MNLI", "cola": "CoLA", "mrpc": "MRPC", "qnli": "QNLI", "qqp": "QQP", "sst2": "SST-2",
+                 "agnews": "Agnews", "yelp-polarity": "yelp_review_polarity_csv", "yelp-full": "yelp_review_full_csv",
+                 "yahoo": "Yahoo", "squad": "SQuAD", "race": "RACE"}
+    train, valid = None, None
+    if mpu.get_model_parallel_rank() == 0:
+        multi_seq_length = args.seq_length
+        if args.multi_seq_length is not None:
+            multi_seq_length = args.multi_seq_length
+        train_datasets, valid_datasets = [], []
+        for task in args.multi_task_data:
+            task = task.lower()
+            data_dir = os.path.join(args.data_dir, task_dirs[task])
+            train_datasets.append(
+                SuperGlueDataset(args, task, data_dir, multi_seq_length, "train", tokenizer, pattern_ensemble=True))
+            valid_datasets.append(
+                SuperGlueDataset(args, task, data_dir, multi_seq_length, "dev", tokenizer, pattern_ensemble=True))
+        train = MultiTaskDataset(args.multi_task_data, train_datasets)
+        valid = MultiTaskDataset(args.multi_task_data, valid_datasets)
+        world_size = torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+        multi_batch_size = args.batch_size * world_size
+        if args.multi_batch_size is not None:
+            multi_batch_size = args.multi_batch_size * world_size
+        train = make_data_loader(train, tokenizer, multi_batch_size, args.train_iters, args, shuffle=True)
+        valid = make_data_loader(valid, tokenizer, multi_batch_size, args.train_iters, args, shuffle=True)
+    return train, valid
 
 
 def get_split(args):

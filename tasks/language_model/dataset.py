@@ -51,7 +51,7 @@ class LMDataset(torch.utils.data.Dataset):
                                                            add_piece=True,
                                                            add_eos=False)
             data = build_input_from_ids(prompt, None, text, self.max_seq_len + num_special_tokens + 1, self.tokenizer,
-                                        args=self.args, add_cls=True, add_sep=False, add_piece=True, add_eos=False)
+                                        args=self.args, add_cls=True, add_sep=False, add_piece=True, add_eos=False, mask_id=self.mask_id)
             ids, types, paddings, position_ids, sep, target_ids, loss_masks = data
             if idx != 0 and self.unidirectional:
                 loss_masks = np.array(loss_masks, dtype=np.int64)
@@ -120,7 +120,8 @@ class LambadaDataset(torch.utils.data.Dataset):
             if left_shift > 0:
                 tokens = tokens[left_shift:]
             data = build_input_from_ids(tokens, None, answer_tokens, self.max_seq_length, self.tokenizer,
-                                        args=self.args, add_cls=True, add_sep=False, add_piece=True)
+                                        args=self.args, add_cls=True, add_sep=False, add_piece=True,
+                                        mask_id=self.mask_id)
             ids, types, paddings, position_ids, sep, target_ids, loss_masks = data
             if self.unidirectional:
                 loss_masks = np.array(loss_masks, dtype=np.int64)
@@ -176,6 +177,7 @@ def build_wikitext103_dataset(tokenizer, args):
         entire_data = reader.read().decode('utf-8')
     num_original_tokens = len(entire_data.strip().split(" "))
     entire_data = get_detokenizer('wikitext')(entire_data)
+    print_rank_0(entire_data[:1024])
     tokenized_data = tokenizer.EncodeAsIds(entire_data).tokenization
     num_tokenized_tokens = len(tokenized_data)
 

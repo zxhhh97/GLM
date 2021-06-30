@@ -19,17 +19,22 @@ import json
 import os
 import random
 import copy
+import glob
+import re
 from abc import ABC, abstractmethod
 from collections import Counter
 from typing import List, Dict, Callable
 from torch.utils.data import Dataset
 from tqdm import tqdm
+import pandas as pd
+import numpy as np
 
 from tasks.data_utils import InputExample
 from utils import print_rank_0
 from tasks.superglue.pvp import PVPS
 from tasks.data_utils import build_input_from_ids, build_sample, num_special_tokens_to_add
 from collections import defaultdict
+from data_utils.corpora import punctuation_standardization
 
 TRAIN_SET = "train"
 DEV_SET = "dev"
@@ -44,26 +49,43 @@ def get_output_func(task_name, args):
     return PROCESSORS[task_name](args).output_prediction
 
 
+def read_tsv(path, **kwargs):
+    return pd.read_csv(path, sep='\t', quoting=csv.QUOTE_NONE, dtype=str, na_filter=False, **kwargs)
+
+
 class SuperGlueDataset(Dataset):
 
-    def __init__(self, args, split, tokenizer, for_train=False):
-        task_name = args.task.lower()
-        data_dir = args.data_dir
-        processor = PROCESSORS[task_name](args)
+    def __init__(self, args, task_name, data_dir, seq_length, split, tokenizer, for_train=False,
+                 pattern_ensemble=False, pattern_text=False):
+        self.processor = PROCESSORS[task_name](args)
+        args.variable_num_choices = self.processor.variable_num_choices
         print_rank_0(
             f"Creating {task_name} dataset from file at {data_dir} (split={split})"
         )
         self.dataset_name = f"{task_name}-{split}"
+        self.cloze_eval = args.cloze_eval
+        self.seq_length = seq_length
+        self.tokenizer = tokenizer
+        self.pattern_ensemble = pattern_ensemble
+        self.pattern_text = pattern_text
+        if pattern_text:
+            assert self.cloze_eval, "Labeled examples only exist in cloze evaluation"
+        self.args = args
         if split == DEV_SET:
-            examples = processor.get_dev_examples(data_dir, for_train=for_train)
+            example_list = self.processor.get_dev_examples(data_dir, for_train=for_train)
         elif split == TEST_SET:
-            examples = processor.get_test_examples(data_dir)
+            example_list = self.processor.get_test_examples(data_dir)
+        elif split == TRUE_DEV_SET:
+            example_list = self.processor.get_true_dev_examples(data_dir)
         elif split == TRAIN_SET:
-            examples = processor.get_train_examples(data_dir)
+            if task_name == "wsc":
+                example_list = self.processor.get_train_examples(data_dir, cloze_eval=args.cloze_eval)
+            else:
+                example_list = self.processor.get_train_examples(data_dir)
         elif split == UNLABELED_SET:
-            examples = processor.get_unlabeled_examples(data_dir)
-            for example in examples:
-                example.label = processor.get_labels()[0]
+            example_list = self.processor.get_unlabeled_examples(data_dir)
+            for example in example_list:
+                example.label = self.processor.get_labels()[0]
         else:
             raise ValueError(f"'split' must be one of {SPLIT_TYPES}, got '{split}' instead")
         if split == TEST_SET:
@@ -71,31 +93,55 @@ class SuperGlueDataset(Dataset):
         else:
             self.labeled = True
 
-        label_distribution = Counter(example.label for example in examples)
+        label_distribution = Counter(example.label for example in example_list)
         print_rank_0(
-            f"Returning {len(examples)} {split} examples with label dist.: {list(label_distribution.items())}")
+            f"Returning {len(example_list)} {split} examples with label dist.: {list(label_distribution.items())}")
         self.samples = []
-        examples.sort(key=lambda x: x.num_choices)
-        if args.cloze_eval:
-            pvp = PVPS[task_name](args, tokenizer, processor.get_labels(), args.seq_length, pattern_id=args.pattern_id,
-                                  fast_decode=args.fast_decode, continuous_prompt=args.continuous_prompt)
-            for example in examples:
-                sample = pvp.encode(example)
-                self.samples.append(sample)
-            print_rank_0(f"Truncate {pvp.num_truncated} examples")
-        else:
-            for example in examples:
-                sample = processor.encode(example, tokenizer, args)
-                self.samples.append(sample)
-            print_rank_0(f"Truncate {processor.num_truncated} examples")
-        print_rank_0(f"Creating {len(self.samples)} samples")
-        self.examples = {example.guid: example for example in examples}
+        example_list.sort(key=lambda x: x.num_choices)
+        self.example_list = example_list
+        if self.cloze_eval:
+            if self.pattern_ensemble:
+                pattern_ids = PVPS[task_name].available_patterns()
+                self.pvps = []
+                for pattern_id in pattern_ids:
+                    self.pvps.append(PVPS[task_name](args, tokenizer, self.processor.get_labels(), seq_length,
+                                                     pattern_id=pattern_id, num_prompt_tokens=args.num_prompt_tokens,
+                                                     is_multi_token=args.multi_token,
+                                                     max_segment_length=args.segment_length,
+                                                     fast_decode=args.fast_decode, split=split))
+            else:
+                self.pvp = PVPS[task_name](args, tokenizer, self.processor.get_labels(), seq_length,
+                                           pattern_id=args.pattern_id, num_prompt_tokens=args.num_prompt_tokens,
+                                           is_multi_token=args.multi_token, max_segment_length=args.segment_length,
+                                           fast_decode=args.fast_decode, split=split)
+        self.examples = {example.guid: example for example in example_list}
 
     def __len__(self):
-        return len(self.samples)
+        if self.cloze_eval and self.pattern_ensemble:
+            return len(self.example_list) * len(self.pvps)
+        else:
+            return len(self.example_list)
 
     def __getitem__(self, idx):
-        return self.samples[idx]
+        sample_idx = idx % len(self.example_list)
+        example = self.example_list[sample_idx]
+        if self.cloze_eval:
+            kwargs = {}
+            if self.pattern_text:
+                kwargs = {"labeled": True, "priming": True}
+            if self.pattern_ensemble:
+                pvp_idx = idx // len(self.example_list)
+                sample = self.pvps[pvp_idx].encode(example, **kwargs)
+            else:
+                sample = self.pvp.encode(example, **kwargs)
+            if self.pattern_text:
+                eos_id = self.tokenizer.get_command('eos').Id
+                cls_id = self.tokenizer.get_command('ENC').Id
+                input_ids = [cls_id] + sample + [eos_id]
+                sample = {'text': input_ids, 'loss_mask': np.array([1] * len(input_ids))}
+        else:
+            sample = self.processor.encode(example, self.tokenizer, self.seq_length, self.args)
+        return sample
 
 
 class DataProcessor(ABC):
@@ -115,6 +161,10 @@ class DataProcessor(ABC):
                 data = {"idx": example.idx, "label": prediction}
                 output.write(json.dumps(data) + "\n")
 
+    @property
+    def variable_num_choices(self):
+        return False
+
     @abstractmethod
     def get_train_examples(self, data_dir) -> List[InputExample]:
         """Get a collection of `InputExample`s for the train set."""
@@ -125,15 +175,13 @@ class DataProcessor(ABC):
         """Get a collection of `InputExample`s for the dev set."""
         pass
 
-    @abstractmethod
     def get_test_examples(self, data_dir) -> List[InputExample]:
         """Get a collection of `InputExample`s for the test set."""
-        pass
+        return []
 
-    @abstractmethod
     def get_unlabeled_examples(self, data_dir) -> List[InputExample]:
         """Get a collection of `InputExample`s for the unlabeled set."""
-        pass
+        return []
 
     @abstractmethod
     def get_labels(self) -> List[str]:
@@ -143,15 +191,15 @@ class DataProcessor(ABC):
     def get_classifier_input(self, example: InputExample, tokenizer):
         return example.text_a, example.text_b
 
-    def encode(self, example: InputExample, tokenizer, args):
+    def encode(self, example: InputExample, tokenizer, seq_length, args):
         text_a, text_b = self.get_classifier_input(example, tokenizer)
         tokens_a = tokenizer.EncodeAsIds(text_a).tokenization
         tokens_b = tokenizer.EncodeAsIds(text_b).tokenization
         num_special_tokens = num_special_tokens_to_add(tokens_a, tokens_b, None, add_cls=True, add_sep=True,
                                                        add_piece=False)
-        if len(tokens_a) + len(tokens_b) + num_special_tokens > args.seq_length:
+        if len(tokens_a) + len(tokens_b) + num_special_tokens > seq_length:
             self.num_truncated += 1
-        data = build_input_from_ids(tokens_a, tokens_b, None, args.seq_length, tokenizer, args=args,
+        data = build_input_from_ids(tokens_a, tokens_b, None, seq_length, tokenizer, args=args,
                                     add_cls=True, add_sep=True, add_piece=False)
         ids, types, paddings, position_ids, sep, target_ids, loss_masks = data
         label = 0
@@ -167,20 +215,35 @@ class DataProcessor(ABC):
         return sample
 
 
-class RteProcessor(DataProcessor):
-    """Processor for the RTE data set."""
-    
+class SuperGLUEProcessor(DataProcessor):
+    def __init__(self, args):
+        super(SuperGLUEProcessor, self).__init__(args)
+        self.few_superglue = args.few_superglue
+
     def get_train_examples(self, data_dir):
         return self._create_examples(os.path.join(data_dir, "train.jsonl"), "train")
 
     def get_dev_examples(self, data_dir, for_train=False):
-        return self._create_examples(os.path.join(data_dir, "val.jsonl"), "dev")
+        if self.few_superglue:
+            return self._create_examples(os.path.join(data_dir, "dev32.jsonl"), "dev")
+        else:
+            return self._create_examples(os.path.join(data_dir, "val.jsonl"), "dev")
 
     def get_test_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "test.jsonl"), "test")
+        if self.few_superglue:
+            return self._create_examples(os.path.join(data_dir, "val.jsonl"), "test")
+        else:
+            return self._create_examples(os.path.join(data_dir, "test.jsonl"), "test")
 
     def get_unlabeled_examples(self, data_dir):
         return self._create_examples(os.path.join(data_dir, "unlabeled.jsonl"), "unlabeled")
+
+    def _create_examples(self, *args, **kwargs):
+        pass
+
+
+class RteProcessor(SuperGLUEProcessor):
+    """Processor for the RTE data set."""
 
     def get_labels(self):
         return ["entailment", "not_entailment"]
@@ -200,13 +263,36 @@ class RteProcessor(DataProcessor):
                         idx = line_idx
                 label = example_json.get('label')
                 guid = "%s-%s" % (set_type, idx)
-                text_a = example_json[premise_name]
-                text_b = example_json[hypothesis_name]
+                text_a = punctuation_standardization(example_json[premise_name])
+                text_b = punctuation_standardization(example_json[hypothesis_name])
 
                 example = InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label, idx=idx)
                 examples.append(example)
 
         return examples
+
+
+class AxGProcessor(RteProcessor):
+    """Processor for the AX-G diagnostic data set."""
+
+    def get_train_examples(self, data_dir):
+        return self._create_examples(os.path.join(data_dir, "AX-g.jsonl"), "train")
+
+    def get_test_examples(self, data_dir):
+        return self._create_examples(os.path.join(data_dir, "AX-g.jsonl"), "test")
+
+
+class AxBProcessor(RteProcessor):
+    """Processor for the AX-B diagnostic data set."""
+
+    def get_train_examples(self, data_dir):
+        return self._create_examples(os.path.join(data_dir, "AX-b.jsonl"), "train")
+
+    def get_test_examples(self, data_dir):
+        return self._create_examples(os.path.join(data_dir, "AX-b.jsonl"), "test")
+
+    def _create_examples(self, path, set_type, hypothesis_name="sentence2", premise_name="sentence1"):
+        return super()._create_examples(path, set_type, hypothesis_name, premise_name)
 
 
 class CbProcessor(RteProcessor):
@@ -216,20 +302,8 @@ class CbProcessor(RteProcessor):
         return ["entailment", "contradiction", "neutral"]
 
 
-class WicProcessor(DataProcessor):
+class WicProcessor(SuperGLUEProcessor):
     """Processor for the WiC data set."""
-
-    def get_train_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "train.jsonl"), "train")
-
-    def get_dev_examples(self, data_dir, for_train=False):
-        return self._create_examples(os.path.join(data_dir, "val.jsonl"), "dev")
-
-    def get_test_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "test.jsonl"), "test")
-
-    def get_unlabeled_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "unlabeled.jsonl"), "unlabeled")
 
     def get_labels(self):
         return ["false", "true"]
@@ -245,8 +319,8 @@ class WicProcessor(DataProcessor):
                     idx = int(idx)
                 label = "true" if example_json.get('label') else "false"
                 guid = "%s-%s" % (set_type, idx)
-                text_a = example_json['sentence1']
-                text_b = example_json['sentence2']
+                text_a = punctuation_standardization(example_json['sentence1'])
+                text_b = punctuation_standardization(example_json['sentence2'])
                 meta = {'word': example_json['word']}
                 example = InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label, idx=idx, meta=meta)
                 examples.append(example)
@@ -257,20 +331,15 @@ class WicProcessor(DataProcessor):
         return text_a, example.text_b
 
 
-class WscProcessor(DataProcessor):
+class WscProcessor(SuperGLUEProcessor):
     """Processor for the WSC data set."""
 
+    @property
+    def variable_num_choices(self):
+        return self.args.wsc_negative
+
     def get_train_examples(self, data_dir, cloze_eval=True):
-        return self._create_examples(os.path.join(data_dir, "train.jsonl"), "train")
-
-    def get_dev_examples(self, data_dir, for_train=False):
-        return self._create_examples(os.path.join(data_dir, "val.jsonl"), "dev")
-
-    def get_test_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "test.jsonl"), "test")
-
-    def get_unlabeled_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "unlabeled.jsonl"), "unlabeled")
+        return self._create_examples(os.path.join(data_dir, "train.jsonl"), "train", cloze_eval=cloze_eval)
 
     def get_labels(self):
         return ["False", "True"]
@@ -286,7 +355,7 @@ class WscProcessor(DataProcessor):
         text_b = target
         return text_a, text_b
 
-    def _create_examples(self, path: str, set_type: str, max_train_candidates=10) -> List[InputExample]:
+    def _create_examples(self, path: str, set_type: str, cloze_eval=True) -> List[InputExample]:
         examples = []
 
         with open(path, encoding='utf8') as f:
@@ -295,7 +364,7 @@ class WscProcessor(DataProcessor):
                 idx = example_json['idx']
                 label = str(example_json['label']) if 'label' in example_json else None
                 guid = "%s-%s" % (set_type, idx)
-                text_a = example_json['text']
+                text_a = punctuation_standardization(example_json['text'])
                 meta = {
                     'span1_text': example_json['target']['span1_text'],
                     'span2_text': example_json['target']['span2_text'],
@@ -344,15 +413,26 @@ class WscProcessor(DataProcessor):
                 text_a = ' '.join(words_a)
                 meta['span1_index'], meta['span2_index'] = span1_index, span2_index
 
-                # Discard negative examples for training
-                if set_type == 'train' and label != 'True':
+                if self.args.task == 'wsc1':
+                    example = InputExample(guid=guid, text_a=text_a, text_b=span1_text,
+                                           label=label, meta=meta, idx=idx)
+                    examples.append(example)
+                    if set_type == 'train' and label == 'True':
+                        for cand in candidates:
+                            example = InputExample(guid=guid, text_a=text_a, text_b=cand,
+                                                   label='False', meta=meta, idx=idx)
+                            examples.append(example)
                     continue
 
-                if set_type == 'train' and 'candidates' in example_json:
-                    for i in range(0, len(candidates), max_train_candidates):
+                if cloze_eval and set_type == 'train' and label != 'True':
+                    continue
+                if set_type == 'train' and 'candidates' in example_json and len(candidates) > 9:
+                    for i in range(0, len(candidates), 9):
                         _meta = copy.deepcopy(meta)
-                        _meta['candidates'] = candidates[i:i + max_train_candidates]
-                        example = InputExample(guid=guid, text_a=text_a, label=None, meta=_meta, idx=idx)
+                        _meta['candidates'] = candidates[i:i + 9]
+                        if len(_meta['candidates']) < 9:
+                            _meta['candidates'] += candidates[:9 - len(_meta['candidates'])]
+                        example = InputExample(guid=guid, text_a=text_a, label=label, meta=_meta, idx=idx)
                         examples.append(example)
                 else:
                     if 'candidates' in example_json:
@@ -363,20 +443,8 @@ class WscProcessor(DataProcessor):
         return examples
 
 
-class BoolQProcessor(DataProcessor):
+class BoolQProcessor(SuperGLUEProcessor):
     """Processor for the BoolQ data set."""
-
-    def get_train_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "train.jsonl"), "train")
-
-    def get_dev_examples(self, data_dir, for_train=False):
-        return self._create_examples(os.path.join(data_dir, "val.jsonl"), "dev")
-
-    def get_test_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "test.jsonl"), "test")
-
-    def get_unlabeled_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "unlabeled.jsonl"), "unlabeled")
 
     def get_labels(self):
         return ["false", "true"]
@@ -391,48 +459,37 @@ class BoolQProcessor(DataProcessor):
                 idx = example_json['idx']
                 label = str(example_json['label']).lower() if 'label' in example_json else None
                 guid = "%s-%s" % (set_type, idx)
-                text_a = example_json['passage']
-                text_b = example_json['question']
+                text_a = punctuation_standardization(example_json['passage'])
+                text_b = punctuation_standardization(example_json['question'])
                 example = InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label, idx=idx)
                 examples.append(example)
 
         return examples
 
 
-class CopaProcessor(DataProcessor):
+class CopaProcessor(SuperGLUEProcessor):
     """Processor for the COPA data set."""
-
-    def get_train_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "train.jsonl"), "train")
-
-    def get_dev_examples(self, data_dir, for_train=False):
-        return self._create_examples(os.path.join(data_dir, "val.jsonl"), "dev")
-
-    def get_test_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "test.jsonl"), "test")
-
-    def get_unlabeled_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "unlabeled.jsonl"), "unlabeled")
 
     def get_labels(self):
         return [0, 1]
 
-    def encode(self, example: InputExample, tokenizer, args):
+    def encode(self, example: InputExample, tokenizer, seq_length, args):
         if args.pretrained_bert:
             ids_list, types_list, paddings_list = [], [], []
         else:
             ids_list, positions_list, sep_list = [], [], []
         question = example.meta['question']
         joiner = 'because' if question == 'cause' else 'so'
-        text_a = example.text_a + " " + joiner
+        text_a = punctuation_standardization(example.text_a) + " " + joiner
         tokens_a = tokenizer.EncodeAsIds(text_a).tokenization
         for choice in [example.meta["choice1"], example.meta["choice2"]]:
+            choice = punctuation_standardization(choice)
             tokens_b = tokenizer.EncodeAsIds(choice).tokenization
             num_special_tokens = num_special_tokens_to_add(tokens_a, tokens_b, None, add_cls=True, add_sep=True,
                                                            add_piece=False)
-            if len(tokens_a) + len(tokens_b) + num_special_tokens > args.seq_length:
+            if len(tokens_a) + len(tokens_b) + num_special_tokens > seq_length:
                 self.num_truncated += 1
-            data = build_input_from_ids(tokens_a, tokens_b, None, args.seq_length, tokenizer, args,
+            data = build_input_from_ids(tokens_a, tokens_b, None, seq_length, tokenizer, args,
                                         add_cls=True, add_sep=True, add_piece=False)
             ids, types, paddings, position_ids, sep, target_ids, loss_masks = data
             if args.pretrained_bert:
@@ -490,20 +547,8 @@ class CopaProcessor(DataProcessor):
         return examples
 
 
-class MultiRcProcessor(DataProcessor):
+class MultiRcProcessor(SuperGLUEProcessor):
     """Processor for the MultiRC data set."""
-
-    def get_train_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "train.jsonl"), "train")
-
-    def get_dev_examples(self, data_dir, for_train=False):
-        return self._create_examples(os.path.join(data_dir, "val.jsonl"), "dev")
-
-    def get_test_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "test.jsonl"), "test")
-
-    def get_unlabeled_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "unlabeled.jsonl"), "unlabeled")
 
     def get_labels(self):
         return [0, 1]
@@ -517,10 +562,10 @@ class MultiRcProcessor(DataProcessor):
                 example_json = json.loads(line)
 
                 passage_idx = example_json['idx']
-                text = example_json['passage']['text']
+                text = punctuation_standardization(example_json['passage']['text'])
                 questions = example_json['passage']['questions']
                 for question_json in questions:
-                    question = question_json["question"]
+                    question = punctuation_standardization(question_json["question"])
                     question_idx = question_json['idx']
                     answers = question_json["answers"]
                     for answer_json in answers:
@@ -531,7 +576,7 @@ class MultiRcProcessor(DataProcessor):
                             'passage_idx': passage_idx,
                             'question_idx': question_idx,
                             'answer_idx': answer_idx,
-                            'answer': answer_json["text"]
+                            'answer': punctuation_standardization(answer_json["text"])
                         }
                         idx = [passage_idx, question_idx, answer_idx]
                         example = InputExample(guid=guid, text_a=text, text_b=question, label=label, meta=meta, idx=idx)
@@ -568,20 +613,75 @@ class MultiRcProcessor(DataProcessor):
         return text_a, text_b
 
 
-class RecordProcessor(DataProcessor):
-    """Processor for the ReCoRD data set."""
+class RaceProcessor(DataProcessor):
+    @property
+    def variable_num_choices(self):
+        return True
+
+    def get_labels(self):
+        return ["A", "B", "C", "D"]
 
     def get_train_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "train.jsonl"), "train")
+        return self._create_examples(os.path.join(data_dir, "train"), "train")
+
+    def get_dev_examples(self, data_dir, for_train=False):
+        return self._create_examples(os.path.join(data_dir, "dev"), "dev", for_train=for_train)
+
+    def get_test_examples(self, data_dir):
+        return self._create_examples(os.path.join(data_dir, "test"), "test")
+
+    @staticmethod
+    def _create_examples(path, set_type, for_train=False) -> List[InputExample]:
+        examples = []
+
+        def clean_text(text):
+            """Remove new lines and multiple spaces and adjust end of sentence dot."""
+
+            text = text.replace("\n", " ")
+            text = re.sub(r'\s+', ' ', text)
+            for _ in range(3):
+                text = text.replace(' . ', '. ')
+
+            return text
+
+        filenames = glob.glob(os.path.join(path, "middle", '*.txt')) + glob.glob(os.path.join(path, "high", "*.txt"))
+        for filename in filenames:
+            with open(filename, 'r') as f:
+                for line in f:
+                    data = json.loads(line)
+                    idx = data["id"]
+                    context = data["article"]
+                    questions = data["questions"]
+                    choices = data["options"]
+                    answers = data["answers"]
+                    # Check the length.
+                    assert len(questions) == len(answers)
+                    assert len(questions) == len(choices)
+
+                    context = clean_text(context)
+                    for question_idx, question in enumerate(questions):
+                        answer = answers[question_idx]
+                        choice = choices[question_idx]
+                        guid = f'{set_type}-p{idx}-q{question_idx}'
+                        ex_idx = [set_type, idx, question_idx]
+                        meta = {
+                            "choices": choice
+                        }
+                        example = InputExample(guid=guid, text_a=context, text_b=question, label=answer, meta=meta,
+                                               idx=ex_idx)
+                        examples.append(example)
+        return examples
+
+
+class RecordProcessor(SuperGLUEProcessor):
+    """Processor for the ReCoRD data set."""
 
     def get_dev_examples(self, data_dir, for_train=False):
         return self._create_examples(os.path.join(data_dir, "val.jsonl"), "dev", for_train=for_train)
 
-    def get_test_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "test.jsonl"), "test")
-
-    def get_unlabeled_examples(self, data_dir):
-        return self._create_examples(os.path.join(data_dir, "unlabeled.jsonl"), "unlabeled")
+    @property
+    def variable_num_choices(self):
+        return True
 
     def get_labels(self):
         return ["0", "1"]
@@ -593,7 +693,7 @@ class RecordProcessor(DataProcessor):
                 data = {"idx": example.idx, "label": prediction}
                 output.write(json.dumps(data) + "\n")
 
-    def encode(self, example: InputExample, tokenizer, args):
+    def encode(self, example: InputExample, tokenizer, seq_length, args):
         if args.pretrained_bert:
             ids_list, types_list, paddings_list = [], [], []
         else:
@@ -605,9 +705,9 @@ class RecordProcessor(DataProcessor):
             total_length = len(tokens_a) + len(tokens_b) + len(answer_ids)
             total_length += num_special_tokens_to_add(tokens_a, tokens_b + answer_ids, None, add_cls=True, add_sep=True,
                                                       add_piece=False)
-            if total_length > args.seq_length:
+            if total_length > seq_length:
                 self.num_truncated += 1
-            data = build_input_from_ids(tokens_a, tokens_b + answer_ids, None, args.seq_length, tokenizer, args,
+            data = build_input_from_ids(tokens_a, tokens_b + answer_ids, None, seq_length, tokenizer, args,
                                         add_cls=True, add_sep=True, add_piece=False)
             ids, types, paddings, position_ids, sep, target_ids, loss_masks = data
             if args.pretrained_bert:
@@ -640,27 +740,28 @@ class RecordProcessor(DataProcessor):
                 example_json = json.loads(line)
 
                 idx = example_json['idx']
-                text = example_json['passage']['text']
+                text = punctuation_standardization(example_json['passage']['text'])
                 entities = set()
 
                 for entity_json in example_json['passage']['entities']:
                     start = entity_json['start']
                     end = entity_json['end']
-                    entity = text[start:end + 1]
+                    entity = punctuation_standardization(text[start:end + 1])
                     entities.add(entity)
 
                 entities = list(entities)
+                entities.sort()
 
                 text = text.replace("@highlight\n", "- ")  # we follow the GPT-3 paper wrt @highlight annotations
                 questions = example_json['qas']
 
                 for question_json in questions:
-                    question = question_json['query']
+                    question = punctuation_standardization(question_json['query'])
                     question_idx = question_json['idx']
                     answers = set()
 
                     for answer_json in question_json.get('answers', []):
-                        answer = answer_json['text']
+                        answer = punctuation_standardization(answer_json['text'])
                         answers.add(answer)
 
                     answers = list(answers)
@@ -706,7 +807,379 @@ class RecordProcessor(DataProcessor):
         return examples
 
 
+class MnliProcessor(DataProcessor):
+    """Processor for the MultiNLI data set (GLUE version)."""
+
+    def get_train_examples(self, data_dir):
+        return self._create_examples(os.path.join(data_dir, "train.tsv"), "train")
+
+    def get_dev_examples(self, data_dir, for_train=False):
+        return self._create_examples(os.path.join(data_dir, "dev_matched.tsv"), "dev_matched")
+
+    def get_test_examples(self, data_dir) -> List[InputExample]:
+        return self._create_examples(os.path.join(data_dir, "test_matched.tsv"), "test_matched")
+
+    def get_unlabeled_examples(self, data_dir) -> List[InputExample]:
+        return self.get_train_examples(data_dir)
+
+    def get_labels(self):
+        return ["contradiction", "entailment", "neutral"]
+
+    @staticmethod
+    def _create_examples(path: str, set_type: str) -> List[InputExample]:
+        examples = []
+        df = read_tsv(path)
+
+        for idx, row in df.iterrows():
+            guid = f"{set_type}-{idx}"
+            text_a = punctuation_standardization(row['sentence1'])
+            text_b = punctuation_standardization(row['sentence2'])
+            label = row.get('gold_label', None)
+            example = InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label)
+            examples.append(example)
+
+        return examples
+
+
+class MnliMismatchedProcessor(MnliProcessor):
+    """Processor for the MultiNLI mismatched data set (GLUE version)."""
+
+    def get_dev_examples(self, data_dir, for_train=False):
+        return self._create_examples(os.path.join(data_dir, "dev_mismatched.tsv"), "dev_mismatched")
+
+    def get_test_examples(self, data_dir) -> List[InputExample]:
+        return self._create_examples(os.path.join(data_dir, "test_mismatched.tsv"), "test_mismatched")
+
+
+class AgnewsProcessor(DataProcessor):
+    """Processor for the AG news data set."""
+
+    def get_train_examples(self, data_dir):
+        return self._create_examples(os.path.join(data_dir, "train.csv"), "train")
+
+    def get_dev_examples(self, data_dir, for_train=False):
+        return self._create_examples(os.path.join(data_dir, "test.csv"), "dev")
+
+    def get_test_examples(self, data_dir) -> List[InputExample]:
+        raise NotImplementedError()
+
+    def get_unlabeled_examples(self, data_dir) -> List[InputExample]:
+        return self.get_train_examples(data_dir)
+
+    def get_labels(self):
+        return ["1", "2", "3", "4"]
+
+    @staticmethod
+    def _create_examples(path: str, set_type: str) -> List[InputExample]:
+        examples = []
+
+        with open(path) as f:
+            reader = csv.reader(f, delimiter=',')
+            for idx, row in enumerate(reader):
+                label, headline, body = row
+                guid = "%s-%s" % (set_type, idx)
+                text_a = punctuation_standardization(headline.replace('\\', ' '))
+                text_b = punctuation_standardization(body.replace('\\', ' '))
+
+                example = InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label)
+                examples.append(example)
+
+        return examples
+
+
+class YahooAnswersProcessor(DataProcessor):
+    """Processor for the Yahoo Answers data set."""
+
+    def get_train_examples(self, data_dir):
+        return self._create_examples(os.path.join(data_dir, "train.csv"), "train")
+
+    def get_dev_examples(self, data_dir, for_train=False):
+        return self._create_examples(os.path.join(data_dir, "test.csv"), "dev")
+
+    def get_test_examples(self, data_dir) -> List[InputExample]:
+        raise NotImplementedError()
+
+    def get_unlabeled_examples(self, data_dir) -> List[InputExample]:
+        return self.get_train_examples(data_dir)
+
+    def get_labels(self):
+        return ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
+
+    @staticmethod
+    def _create_examples(path: str, set_type: str) -> List[InputExample]:
+        examples = []
+
+        with open(path, encoding='utf8') as f:
+            reader = csv.reader(f, delimiter=',')
+            for idx, row in enumerate(reader):
+                label, question_title, question_body, answer = row
+                guid = "%s-%s" % (set_type, idx)
+                text_a = ' '.join([question_title.replace('\\n', ' ').replace('\\', ' '),
+                                   question_body.replace('\\n', ' ').replace('\\', ' ')])
+                text_a = punctuation_standardization(text_a)
+                text_b = answer.replace('\\n', ' ').replace('\\', ' ')
+                text_b = punctuation_standardization(text_b)
+
+                example = InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label)
+                examples.append(example)
+
+        return examples
+
+
+class YelpPolarityProcessor(DataProcessor):
+    """Processor for the YELP binary classification set."""
+
+    def get_train_examples(self, data_dir):
+        return self._create_examples(os.path.join(data_dir, "train.csv"), "train")
+
+    def get_dev_examples(self, data_dir, for_train=False):
+        return self._create_examples(os.path.join(data_dir, "test.csv"), "dev")
+
+    def get_test_examples(self, data_dir) -> List[InputExample]:
+        raise NotImplementedError()
+
+    def get_unlabeled_examples(self, data_dir) -> List[InputExample]:
+        return self.get_train_examples(data_dir)
+
+    def get_labels(self):
+        return ["1", "2"]
+
+    @staticmethod
+    def _create_examples(path: str, set_type: str) -> List[InputExample]:
+        examples = []
+
+        with open(path) as f:
+            reader = csv.reader(f, delimiter=',')
+            for idx, row in enumerate(reader):
+                label, body = row
+                guid = "%s-%s" % (set_type, idx)
+                text_a = body.replace('\\n', ' ').replace('\\', ' ')
+                text_a = punctuation_standardization(text_a)
+
+                example = InputExample(guid=guid, text_a=text_a, label=label)
+                examples.append(example)
+
+        return examples
+
+
+class YelpFullProcessor(YelpPolarityProcessor):
+    """Processor for the YELP full classification set."""
+
+    def get_test_examples(self, data_dir) -> List[InputExample]:
+        raise NotImplementedError()
+
+    def get_labels(self):
+        return ["1", "2", "3", "4", "5"]
+
+
+class XStanceProcessor(DataProcessor):
+    """Processor for the X-Stance data set."""
+
+    def __init__(self, args, language: str = None):
+        super().__init__(args)
+        if language is not None:
+            assert language in ['de', 'fr']
+        self.language = language
+
+    def get_train_examples(self, data_dir):
+        return self._create_examples(os.path.join(data_dir, "train.jsonl"))
+
+    def get_dev_examples(self, data_dir, for_train=False):
+        return self._create_examples(os.path.join(data_dir, "test.jsonl"))
+
+    def get_test_examples(self, data_dir) -> List[InputExample]:
+        raise NotImplementedError()
+
+    def get_unlabeled_examples(self, data_dir) -> List[InputExample]:
+        return self.get_train_examples(data_dir)
+
+    def get_labels(self):
+        return ["FAVOR", "AGAINST"]
+
+    def _create_examples(self, path: str) -> List[InputExample]:
+        examples = []
+
+        with open(path, encoding='utf8') as f:
+            for line in f:
+                example_json = json.loads(line)
+                label = example_json['label']
+                id_ = example_json['id']
+                text_a = punctuation_standardization(example_json['question'])
+                text_b = punctuation_standardization(example_json['comment'])
+                language = example_json['language']
+
+                if self.language is not None and language != self.language:
+                    continue
+
+                example = InputExample(guid=id_, text_a=text_a, text_b=text_b, label=label)
+                examples.append(example)
+
+        return examples
+
+
+class Sst2Processor(DataProcessor):
+
+    def get_train_examples(self, data_dir):
+        return self._create_examples(os.path.join(data_dir, "train.tsv"), "train")
+
+    def get_dev_examples(self, data_dir, for_train=False):
+        return self._create_examples(os.path.join(data_dir, "dev.tsv"), "dev")
+
+    def get_test_examples(self, data_dir) -> List[InputExample]:
+        return self._create_examples(os.path.join(data_dir, "test.tsv"), "test")
+
+    def get_labels(self):
+        return ["0", "1"]
+
+    @staticmethod
+    def _create_examples(path: str, set_type: str) -> List[InputExample]:
+        examples = []
+        df = read_tsv(path)
+
+        for idx, row in df.iterrows():
+            guid = f"{set_type}-{idx}"
+            text_a = punctuation_standardization(row['sentence'])
+            label = row.get('label', None)
+            example = InputExample(guid=guid, text_a=text_a, label=label)
+            examples.append(example)
+
+        return examples
+
+
+class ColaProcessor(Sst2Processor):
+
+    def get_labels(self):
+        return ["0", "1"]
+
+    @staticmethod
+    def _create_examples(path: str, set_type: str) -> List[InputExample]:
+        examples = []
+        if set_type != 'test':
+            df = read_tsv(path, header=None)
+        else:
+            df = read_tsv(path)
+
+        for idx, row in df.iterrows():
+            guid = f"{set_type}-{idx}"
+            if set_type != 'test':
+                text_a = punctuation_standardization(row[3])
+                label = row[1]
+            else:
+                text_a = punctuation_standardization(row['sentence'])
+                label = None
+            example = InputExample(guid=guid, text_a=text_a, label=label)
+            examples.append(example)
+
+        return examples
+
+
+class MrpcProcessor(Sst2Processor):
+
+    def get_labels(self):
+        return ["0", "1"]
+
+    @staticmethod
+    def _create_examples(path: str, set_type: str) -> List[InputExample]:
+        examples = []
+        df = read_tsv(path)
+
+        for idx, row in df.iterrows():
+            guid = f"{set_type}-{idx}"
+            text_a = punctuation_standardization(row['#1 String'])
+            text_b = punctuation_standardization(row['#2 String'])
+            label = row.get('Quality', None)
+            example = InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label)
+            examples.append(example)
+
+        return examples
+
+
+class QqpProcessor(Sst2Processor):
+
+    def get_labels(self):
+        return ["0", "1"]
+
+    @staticmethod
+    def _create_examples(path: str, set_type: str) -> List[InputExample]:
+        examples = []
+        df = read_tsv(path)
+
+        for idx, row in df.iterrows():
+            guid = f"{set_type}-{idx}"
+            text_a = punctuation_standardization(row['question1'])
+            text_b = punctuation_standardization(row['question2'])
+            label = row.get('is_duplicate', None)
+            example = InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label)
+            examples.append(example)
+
+        return examples
+
+
+class QnliProcessor(Sst2Processor):
+
+    def get_labels(self):
+        return ["entailment", "not_entailment"]
+
+    @staticmethod
+    def _create_examples(path: str, set_type: str) -> List[InputExample]:
+        examples = []
+        df = read_tsv(path)
+
+        for idx, row in df.iterrows():
+            guid = f"{set_type}-{idx}"
+            text_a = punctuation_standardization(row['question'])
+            text_b = punctuation_standardization(row['sentence'])
+            label = row.get('label', None)
+            example = InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label)
+            examples.append(example)
+
+        return examples
+
+
+class SquadProcessor(DataProcessor):
+
+    def get_train_examples(self, data_dir):
+        return self._create_examples(os.path.join(data_dir, "train-v2.0.json"), "train")
+
+    def get_dev_examples(self, data_dir, for_train=False):
+        return self._create_examples(os.path.join(data_dir, "dev-v2.0.json"), "dev")
+
+    def get_labels(self):
+        return ['0']
+
+    @staticmethod
+    def _create_examples(path: str, set_type: str) -> List[InputExample]:
+        examples = []
+        with open(path) as f:
+            data = json.load(f)['data']
+
+        for idx, passage in enumerate(data):
+            for pid, paragraph in enumerate(passage['paragraphs']):
+                context = paragraph['context']
+                for qid, qas in enumerate(paragraph['qas']):
+                    if len(qas['answers']) == 0:
+                        continue
+                    guid = f"{set_type}-{idx}-{pid}-{qid}"
+                    example = InputExample(guid=guid, text_a=context, text_b=qas['question'], label='0',
+                                           meta={'answer': qas['answers'][0]})
+                    examples.append(example)
+
+        return examples
+
+
+CLASSIFICATION_DATASETS = {"wic", "rte", "cb", "boolq", "multirc", "wsc"}
+MULTI_CHOICE_DATASETS = {"copa", "record"}
+
 PROCESSORS = {
+    "mnli": MnliProcessor,
+    "mnli-mm": MnliMismatchedProcessor,
+    "agnews": AgnewsProcessor,
+    "yahoo": YahooAnswersProcessor,
+    "yelp-polarity": YelpPolarityProcessor,
+    "yelp-full": YelpFullProcessor,
+    "xstance-de": lambda: XStanceProcessor("de"),
+    "xstance-fr": lambda: XStanceProcessor("fr"),
+    "xstance": XStanceProcessor,
     "wic": WicProcessor,
     "rte": RteProcessor,
     "cb": CbProcessor,
@@ -716,4 +1189,14 @@ PROCESSORS = {
     "copa": CopaProcessor,
     "multirc": MultiRcProcessor,
     "record": RecordProcessor,
-}
+    "ax-g": AxGProcessor,
+    "ax-b": AxBProcessor,
+    "sst2": Sst2Processor,
+    "cola": ColaProcessor,
+    "mrpc": MrpcProcessor,
+    "qqp": QqpProcessor,
+    "qnli": QnliProcessor,
+    "squad": SquadProcessor,
+    "race": RaceProcessor,
+    "squad": SquadProcessor
+}  # type: Dict[str,Callable[[1],DataProcessor]]

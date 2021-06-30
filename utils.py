@@ -23,7 +23,6 @@ import torch
 import json
 import subprocess
 
-from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from fp16 import FP16_Optimizer
 import mpu
 from tensorboardX import SummaryWriter
@@ -55,6 +54,21 @@ def get_hostname():
     result = subprocess.check_output(hostname_cmd, shell=True)
     master_addr = result.decode('utf-8').split()[0]
     return master_addr
+
+
+def get_spare_port(args):
+    if torch.distributed.get_rank() == 0:
+        port = subprocess.check_output(["shuf -n 1 -i 10000-65535"], shell=True)
+        port = int(port.strip())
+        if port == args.master_port:
+            port = subprocess.check_output(["shuf -n 1 -i 10000-65535"], shell=True)
+            port = int(port.strip())
+        port = torch.cuda.LongTensor([port])
+    else:
+        port = torch.cuda.LongTensor([0])
+    torch.distributed.broadcast(port, 0)
+    port = port.item()
+    return port
 
 
 def print_and_save_args(args, verbose=True, log_dir=None):
@@ -191,7 +205,7 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False, zero=False):
 def ensure_directory_exists(filename):
     dirname = os.path.dirname(filename)
     if not os.path.exists(dirname):
-        os.makedirs(dirname)
+        os.makedirs(dirname, exist_ok=True)
 
 
 def get_checkpoint_tracker_filename(checkpoints_path):
@@ -207,28 +221,33 @@ def save_zero_checkpoint(args, iteration, optimizer):
     print('  successfully saved {}'.format(zero_checkpoint_name))
 
 
-def save_checkpoint(iteration, model, optimizer, lr_scheduler, args, tag=None, barrier=True):
+def save_checkpoint(iteration, model, optimizer, lr_scheduler, args, tag=None, barrier=True,
+                    only_changed_parameters=False, no_deepspeed=False, no_save_optim=False):
     """Save a model checkpoint."""
     if tag is None:
         tag = str(iteration)
-    if args.deepspeed:
+    if args.deepspeed and not no_deepspeed:
         save_ds_checkpoint(iteration, model, lr_scheduler, args, tag=tag)
     else:
         # Only rank zer0 of the data parallel writes to the disk.
-        if isinstance(model, torchDDP):
-            model = model.module
 
         if mpu.get_data_parallel_rank() == 0:
             checkpoint_name = get_checkpoint_name(args.save, tag)
             print('global rank {} is saving checkpoint at iteration {:7d} to {}'.
                   format(torch.distributed.get_rank(), iteration, checkpoint_name))
-
-            sd = {}
-            sd['iteration'] = iteration
-            sd['module'] = model.state_dict()
+            sd = {'iteration': iteration}
+            if args.deepspeed:
+                model = model.module
+            state_dict = model.state_dict()
+            if only_changed_parameters:
+                requires_grad_dict = {}
+                for name, parameter in model.named_parameters():
+                    requires_grad_dict[name] = parameter.requires_grad
+                state_dict = {key: value for key, value in state_dict.items() if requires_grad_dict[key]}
+            sd['module'] = state_dict
 
             # Optimizer stuff.
-            if not args.no_save_optim:
+            if not args.no_save_optim and not no_save_optim:
                 if optimizer is not None:
                     sd['optimizer'] = optimizer.state_dict()
                 if lr_scheduler is not None:
@@ -273,52 +292,52 @@ def save_ds_checkpoint(iteration, model, lr_scheduler, args, tag):
     model.save_checkpoint(args.save, tag, client_state=sd)
 
 
-def get_checkpoint_iteration(args):
+def get_checkpoint_iteration(load_path):
     # Read the tracker file and set the iteration.
-    tracker_filename = get_checkpoint_tracker_filename(args.load)
+    tracker_filename = get_checkpoint_tracker_filename(load_path)
     if not os.path.isfile(tracker_filename):
         print_rank_0('WARNING: could not find the metadata file {} '.format(
             tracker_filename))
-        if os.path.isdir(args.load):
-            path = os.path.normpath(args.load)
+        if os.path.isdir(load_path):
+            path = os.path.normpath(load_path)
             load_dir, tag = os.path.split(path)
             print_rank_0('Try to directly load the checkpoint from the directory')
             return load_dir, tag, False, True
         print_rank_0('    will not load any checkpoints and will start from '
                      'random')
-        return args.load, 0, False, False
-    iteration = 0
-    release = False
+        return load_path, 0, False, False
     with open(tracker_filename, 'r') as f:
         metastring = f.read().strip()
-        try:
-            iteration = int(metastring)
-        except ValueError:
-            release = metastring == 'release'
-            if not release:
-                print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
-                    tracker_filename))
-                exit()
+        release = metastring == 'release'
+        # try:
+        #     iteration = int(metastring)
+        # except ValueError:
+        #     release = metastring == 'release'
+        #     if not release:
+        #         print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
+        #             tracker_filename))
+        #         exit()
 
-    assert iteration > 0 or release, 'error parsing metadata file {}'.format(
-        tracker_filename)
+    # assert iteration > 0 or release, 'error parsing metadata file {}'.format(
+    #     tracker_filename)
 
-    return args.load, iteration, release, True
+    return load_path, metastring, release, True
 
 
-def load_checkpoint(model, optimizer, lr_scheduler, args):
+def load_checkpoint(model, optimizer, lr_scheduler, args, no_deepspeed=False, no_load_optim=False):
     """Load a model checkpoint."""
 
-    load_dir, tag, release, success = get_checkpoint_iteration(args)
+    load_dir, tag, release, success = get_checkpoint_iteration(args.load)
 
     if not success:
         return 0
 
-    if args.deepspeed:
+    if args.deepspeed and not no_deepspeed:
 
-        checkpoint_name, sd = model.load_checkpoint(load_dir, tag, load_optimizer_states=not args.no_load_optim,
-                                                    load_lr_scheduler_states=not args.no_load_optim)
-        if "client_lr_scheduler" in sd:
+        checkpoint_name, sd = model.load_checkpoint(load_dir, tag,
+                                                    load_optimizer_states=not args.no_load_optim and not no_load_optim,
+                                                    load_lr_scheduler_states=not args.no_load_lr_scheduler)
+        if not args.no_load_lr_scheduler and "client_lr_scheduler" in sd:
             lr_scheduler.load_state_dict(sd["client_lr_scheduler"])
             print_rank_0("Load lr scheduler state")
         if checkpoint_name is None:
@@ -338,41 +357,15 @@ def load_checkpoint(model, optimizer, lr_scheduler, args):
         # Load the checkpoint.
         sd = torch.load(checkpoint_name, map_location='cpu')
 
-        if isinstance(model, torchDDP):
-            model = model.module
-
         # Model.
-        try:
-            def extend_embedding_weights(state_weights, model_weights):
-                original_length = state_weights.shape[0]
-                assert original_length <= args.max_position_embeddings + 1
-                new_weights = model_weights.clone()
-                new_weights[:original_length] = state_weights
-                return new_weights
-
-            if args.block_lm:
-                if "transformer.block_position_embeddings.weight" in sd["module"]:
-                    position_weights = sd['module']["transformer.position_embeddings.weight"]
-                    if args.max_position_embeddings + 1 > position_weights.shape[0]:
-                        sd['module']["transformer.position_embeddings.weight"] = extend_embedding_weights(
-                            position_weights, model.state_dict()["transformer.position_embeddings.weight"].data)
-                        print_rank_0(f"Extend position embedding to {args.max_position_embeddings + 1}")
-                if "transformer.block_position_embeddings.weight" in sd["module"]:
-                    block_position_weights = sd['module']["transformer.block_position_embeddings.weight"]
-                    if args.max_position_embeddings + 1 > block_position_weights.shape[0]:
-                        sd['module']["transformer.block_position_embeddings.weight"] = extend_embedding_weights(
-                            block_position_weights,
-                            model.state_dict()["transformer.block_position_embeddings.weight"].data)
-                        print_rank_0(f"Extend block position embedding to {args.max_position_embeddings + 1}")
-
-            model.load_state_dict(sd['module'], strict=False)
-        except KeyError:
-            print_rank_0('A metadata file exists but unable to load model '
-                         'from checkpoint {}, exiting'.format(checkpoint_name))
-            exit()
+        if args.deepspeed:
+            model = model.module
+        missing_keys, unexpected_keys = model.load_state_dict(sd['module'], strict=False)
+        if missing_keys or unexpected_keys:
+            print_rank_0(f"Missing keys {missing_keys}, unexpected keys {unexpected_keys}")
 
         # Optimizer.
-        if not release and not args.finetune and not args.no_load_optim:
+        if not release and not args.finetune and not args.no_load_optim and not no_load_optim:
             try:
                 if optimizer is not None:
                     optimizer.load_state_dict(sd['optimizer'])
@@ -396,8 +389,8 @@ def load_checkpoint(model, optimizer, lr_scheduler, args):
                 iteration = sd['total_iters']
             except KeyError:
                 print_rank_0('A metadata file exists but Unable to load iteration '
-                             ' from checkpoint {}, exiting'.format(checkpoint_name))
-                exit()
+                             ' from checkpoint {}, starting from zero'.format(checkpoint_name))
+                iteration = 0
 
     # rng states.
     if not release and not args.finetune and not args.no_load_rng:
@@ -475,3 +468,28 @@ def move_weights(our, oai, dst2src=False):
 
     for our_layer, oai_layer in zip(our.transformer.layers, oai.transformer.h):
         load_transformer_layer(our_layer, oai_layer, dst2src)
+
+
+def debug_finetune_data(local_vars, batch_id, tokenizer):
+    tokens, target_ids = local_vars["tokens"], local_vars["target_ids"]
+    attention_mask, logit_mask, position_ids = local_vars["attention_mask"], local_vars["logit_mask"], local_vars[
+        "position_ids"]
+    output_tokens = []
+    sep = attention_mask[batch_id].item()
+    for i, token in enumerate(tokens[batch_id][:sep].tolist()):
+        token = tokenizer.IdToToken(token)
+        if token == '[MASK]':
+            token = f"[{position_ids[batch_id][0, i].item()}]"
+        output_tokens.append(token)
+    print(" ".join(output_tokens))
+    target_positions = []
+    for i in range(sep, tokens.size(-1)):
+        if logit_mask[batch_id][i]:
+            target_positions.append(i)
+    print(target_positions)
+    print(tokenizer.DecodeIds(tokens[batch_id][target_positions].tolist()))
+    if len(target_ids.shape) > 2:
+        print(tokenizer.DecodeIds(target_ids[batch_id][target_positions].tolist()))
+    else:
+        print(tokenizer.DecodeIds(target_ids[batch_id].tolist()))
+    print(position_ids[batch_id][:, target_positions])
